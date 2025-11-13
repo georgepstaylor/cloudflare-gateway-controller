@@ -10,10 +10,11 @@ RUN go mod download
 # Copy source code (changes more frequently)
 COPY cmd/ cmd/
 COPY internal/ internal/
-COPY api/ api/
 
-# Build (remove -a flag to use cache)
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o manager cmd/main.go
+# Build using build args from buildx
+ARG TARGETOS
+ARG TARGETARCH
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -o manager cmd/main.go
 
 # Runtime stage
 FROM gcr.io/distroless/static:nonroot
