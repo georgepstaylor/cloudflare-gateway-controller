@@ -1,0 +1,38 @@
+{
+    "packages": {
+        ".": {
+            "release-type": "go",
+            "component": "cloudflare-gateway-controller",
+            "include-v-in-tag": true,
+            "bump-minor-pre-major": true,
+            "bump-patch-for-minor-pre-major": true,
+            "changelog-sections": [
+                {
+                    "type": "feat",
+                    "section": "Features"
+                },
+                {
+                    "type": "fix",
+                    "section": "Bug Fixes"
+                },
+                {
+                    "type": "perf",
+                    "section": "Performance Improvements"
+                },
+                {
+                    "type": "docs",
+                    "section": "Documentation",
+                    "hidden": false
+                },
+                {
+                    "type": "chore",
+                    "section": "Miscellaneous",
+                    "hidden": true
+                }
+            ],
+            "extra-files": [
+                "Makefile"
+            ]
+        }
+    }
+}
