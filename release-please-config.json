@@ -4,8 +4,8 @@
             "release-type": "go",
             "component": "cloudflare-gateway-controller",
             "include-v-in-tag": true,
-            "bump-minor-pre-major": true,
-            "bump-patch-for-minor-pre-major": true,
+            "bump-minor-pre-major": false,
+            "bump-patch-for-minor-pre-major": false,
             "changelog-sections": [
                 {
                     "type": "feat",
