@@ -3,7 +3,9 @@ name: Build and Push Container Image
 on:
     push:
         tags:
-            - "*"
+            - "cloudflare-gateway-controller-v*"
+    release:
+        types: [published]
     pull_request:
         branches:
             - main
