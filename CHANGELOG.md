@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.7](https://github.com/georgepstaylor/cloudflare-gateway-controller/compare/cloudflare-gateway-controller-v0.1.6...cloudflare-gateway-controller-v0.1.7) (2025-11-14)
+
+
+### Miscellaneous
+
+* re-release ([760424e](https://github.com/georgepstaylor/cloudflare-gateway-controller/commit/760424e65b030187020fcf57011e2bb2f48afde3))
+
 ## [0.1.6](https://github.com/georgepstaylor/cloudflare-gateway-controller/compare/cloudflare-gateway-controller-v0.1.5...cloudflare-gateway-controller-v0.1.6) (2025-11-14)
 
 
