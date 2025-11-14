@@ -10,6 +10,9 @@ else
 GOBIN=$(shell go env GOBIN)
 endif
 
+# Controller-gen tool
+CONTROLLER_GEN = $(GOBIN)/controller-gen
+
 # CONTAINER_TOOL defines the container tool to be used for building images.
 CONTAINER_TOOL ?= docker
 
@@ -30,7 +33,7 @@ help: ## Display this help.
 
 .PHONY: manifests
 manifests: controller-gen ## Generate RBAC manifests (to copy to Helm chart repo).
-	$(CONTROLLER_GEN) rbac:roleName=cloudflare-gateway-controller paths="./internal/controller/..." output:rbac:artifacts:config=config/rbac
+	@$(CONTROLLER_GEN) rbac:roleName=cloudflare-gateway-system-cloudflare-gateway-controller-role paths="./internal/controller/..." output:rbac:artifacts:config=config/rbac
 
 .PHONY: generate
 generate: controller-gen ## Generate code containing DeepCopy, DeepCopyInto, and DeepCopyObject method implementations.
