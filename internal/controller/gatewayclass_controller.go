@@ -150,3 +150,5 @@ func (r *GatewayClassReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		For(&gatewayv1.GatewayClass{}).
 		Complete(r)
 }
+
+// adding a comment to trigger a change
