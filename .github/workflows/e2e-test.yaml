@@ -25,8 +25,8 @@ jobs:
             - name: Get Secrets
               uses: bitwarden/sm-action@v2
               with:
+                  cloud_region: eu
                   access_token: ${{ secrets.BW_ACCESS_TOKEN }}
-                  base_url: https://vault.bitwarden.com
                   secrets: |
                       0bf9c2bd-f0d6-43f0-be07-b39400060b83 > CLOUDFLARE_ACCOUNT_ID
                       8305fd5c-2b7f-482d-8174-b393010e3a32 > CLOUDFLARE_API_TOKEN
