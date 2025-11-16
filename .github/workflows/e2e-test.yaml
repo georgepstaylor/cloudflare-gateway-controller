@@ -274,6 +274,10 @@ jobs:
                   helm list -n cloudflare-gateway-system
                   kubectl describe deployment -n cloudflare-gateway-system -l app.kubernetes.io/name=cloudflare-gateway-controller
 
+            - name: Test public access to application
+              run: |
+                  curl -L https://cfgc.george.dev -H "Host: cfgc.george.dev" --max-time 10
+
             - name: Export logs on failure
               if: failure()
               run: |
