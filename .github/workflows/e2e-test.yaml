@@ -1,0 +1,351 @@
+name: E2E Tests
+
+on:
+    pull_request:
+        branches: [main]
+    push:
+        branches: [main]
+    workflow_dispatch:
+
+env:
+    GO_VERSION: "1.24"
+    KIND_VERSION: "v0.25.0"
+    KUBECTL_VERSION: "v1.31.0"
+    GATEWAY_API_VERSION: "v1.4.0"
+
+jobs:
+    e2e-test:
+        name: End-to-End Tests
+        runs-on: ubuntu-latest
+
+        steps:
+            - name: Checkout code
+              uses: actions/checkout@v4
+
+            - name: Get Secrets
+              uses: bitwarden/sm-action@v2
+              with:
+                  access_token: ${{ secrets.BW_ACCESS_TOKEN }}
+                  base_url: https://vault.bitwarden.com
+                  secrets: |
+                      0bf9c2bd-f0d6-43f0-be07-b39400060b83 > CLOUDFLARE_ACCOUNT_ID
+                      8305fd5c-2b7f-482d-8174-b393010e3a32 > CLOUDFLARE_API_TOKEN
+
+            - name: Set up Go
+              uses: actions/setup-go@v5
+              with:
+                  go-version: ${{ env.GO_VERSION }}
+                  cache: true
+
+            - name: Install kubectl
+              run: |
+                  curl -LO "https://dl.k8s.io/release/${{ env.KUBECTL_VERSION }}/bin/linux/amd64/kubectl"
+                  chmod +x kubectl
+                  sudo mv kubectl /usr/local/bin/
+                  kubectl version --client
+
+            - name: Install kind
+              run: |
+                  curl -Lo ./kind "https://kind.sigs.k8s.io/dl/${{ env.KIND_VERSION }}/kind-linux-amd64"
+                  chmod +x ./kind
+                  sudo mv ./kind /usr/local/bin/kind
+                  kind version
+
+            - name: Create kind cluster
+              run: |
+                  cat <<EOF | kind create cluster --config=-
+                  kind: Cluster
+                  apiVersion: kind.x-k8s.io/v1alpha4
+                  name: cloudflare-gateway-e2e
+                  nodes:
+                  - role: control-plane
+                    image: kindest/node:v1.31.0
+                  - role: worker
+                    image: kindest/node:v1.31.0
+                  EOF
+
+                  kubectl cluster-info
+                  kubectl get nodes
+
+            - name: Install Gateway API CRDs
+              run: |
+                  kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/${{ env.GATEWAY_API_VERSION }}/standard-install.yaml
+                  kubectl wait --for condition=established --timeout=60s crd/gatewayclasses.gateway.networking.k8s.io
+                  kubectl wait --for condition=established --timeout=60s crd/gateways.gateway.networking.k8s.io
+                  kubectl wait --for condition=established --timeout=60s crd/httproutes.gateway.networking.k8s.io
+
+            - name: Build controller binary
+              run: |
+                  make build
+                  ls -lh bin/manager
+
+            - name: Build and load Docker image
+              run: |
+                  make docker-build IMG=cloudflare-gateway-controller:test
+                  kind load docker-image cloudflare-gateway-controller:test --name cloudflare-gateway-e2e
+
+            - name: Create namespace
+              run: |
+                  kubectl create namespace cloudflare-gateway-system
+
+            - name: Create Cloudflare credentials secret
+              run: |
+                  kubectl create secret generic cloudflare-credentials \
+                    --namespace cloudflare-gateway-system \
+                    --from-literal=api-token=${{ env.CLOUDFLARE_API_TOKEN }} \
+                    --from-literal=account-id=${{ env.CLOUDFLARE_ACCOUNT_ID }}
+
+            - name: Deploy controller
+              run: |
+                  cat <<EOF | kubectl apply -f -
+                  apiVersion: v1
+                  kind: ServiceAccount
+                  metadata:
+                    name: cloudflare-gateway-controller
+                    namespace: cloudflare-gateway-system
+                  ---
+                  apiVersion: rbac.authorization.k8s.io/v1
+                  kind: ClusterRole
+                  metadata:
+                    name: cloudflare-gateway-controller-role
+                  rules:
+                  - apiGroups:
+                    - ""
+                    resources:
+                    - secrets
+                    verbs:
+                    - get
+                    - list
+                    - watch
+                  - apiGroups:
+                    - gateway.networking.k8s.io
+                    resources:
+                    - gatewayclasses
+                    - gateways
+                    - httproutes
+                    verbs:
+                    - get
+                    - list
+                    - watch
+                  - apiGroups:
+                    - gateway.networking.k8s.io
+                    resources:
+                    - gatewayclasses/status
+                    - gateways/status
+                    - httproutes/status
+                    verbs:
+                    - get
+                    - patch
+                    - update
+                  ---
+                  apiVersion: rbac.authorization.k8s.io/v1
+                  kind: ClusterRoleBinding
+                  metadata:
+                    name: cloudflare-gateway-controller-rolebinding
+                  roleRef:
+                    apiGroup: rbac.authorization.k8s.io
+                    kind: ClusterRole
+                    name: cloudflare-gateway-controller-role
+                  subjects:
+                  - kind: ServiceAccount
+                    name: cloudflare-gateway-controller
+                    namespace: cloudflare-gateway-system
+                  ---
+                  apiVersion: apps/v1
+                  kind: Deployment
+                  metadata:
+                    name: cloudflare-gateway-controller
+                    namespace: cloudflare-gateway-system
+                  spec:
+                    replicas: 1
+                    selector:
+                      matchLabels:
+                        app: cloudflare-gateway-controller
+                    template:
+                      metadata:
+                        labels:
+                          app: cloudflare-gateway-controller
+                      spec:
+                        serviceAccountName: cloudflare-gateway-controller
+                        containers:
+                        - name: manager
+                          image: cloudflare-gateway-controller:test
+                          imagePullPolicy: Never
+                          resources:
+                            limits:
+                              cpu: 500m
+                              memory: 128Mi
+                            requests:
+                              cpu: 10m
+                              memory: 64Mi
+                  EOF
+
+            - name: Wait for controller to be ready
+              run: |
+                  kubectl wait --for=condition=available --timeout=120s \
+                    deployment/cloudflare-gateway-controller \
+                    -n cloudflare-gateway-system
+
+                  kubectl get pods -n cloudflare-gateway-system
+                  kubectl logs -n cloudflare-gateway-system deployment/cloudflare-gateway-controller --tail=50
+
+            - name: Create test namespace
+              run: |
+                  kubectl create namespace hello-world
+
+            - name: Create GatewayClass
+              run: |
+                  cat <<EOF | kubectl apply -f -
+                  apiVersion: gateway.networking.k8s.io/v1
+                  kind: GatewayClass
+                  metadata:
+                    name: cloudflare
+                  spec:
+                    controllerName: george.dev/cloudflare-gateway-controller
+                    parametersRef:
+                      group: ""
+                      kind: Secret
+                      name: cloudflare-credentials
+                      namespace: cloudflare-gateway-system
+                  EOF
+
+            - name: Wait for GatewayClass to be accepted
+              run: |
+                  timeout 60s bash -c 'until kubectl get gatewayclass cloudflare -o jsonpath="{.status.conditions[?(@.type==\"Accepted\")].status}" | grep -q "True"; do sleep 2; done' || true
+                  kubectl get gatewayclass cloudflare -o yaml
+
+            - name: Create Gateway
+              run: |
+                  cat <<EOF | kubectl apply -f -
+                  apiVersion: gateway.networking.k8s.io/v1
+                  kind: Gateway
+                  metadata:
+                    name: hello-world-gateway
+                    namespace: hello-world
+                  spec:
+                    gatewayClassName: cloudflare
+                    listeners:
+                      - name: http
+                        protocol: HTTP
+                        port: 80
+                  EOF
+
+            - name: Wait for Gateway to be programmed
+              run: |
+                  timeout 60s bash -c 'until kubectl get gateway hello-world-gateway -n hello-world -o jsonpath="{.status.conditions[?(@.type==\"Programmed\")].status}" | grep -q "True"; do sleep 2; done' || true
+                  kubectl get gateway hello-world-gateway -n hello-world -o yaml
+
+            - name: Deploy test application
+              run: |
+                  kubectl apply -f - <<EOF
+                  apiVersion: apps/v1
+                  kind: Deployment
+                  metadata:
+                    name: hello-world
+                    namespace: hello-world
+                  spec:
+                    replicas: 1
+                    selector:
+                      matchLabels:
+                        app: hello-world
+                    template:
+                      metadata:
+                        labels:
+                          app: hello-world
+                      spec:
+                        containers:
+                        - name: echo-server
+                          image: ealen/echo-server:latest
+                          ports:
+                          - containerPort: 80
+                          env:
+                          - name: PORT
+                            value: "80"
+                  ---
+                  apiVersion: v1
+                  kind: Service
+                  metadata:
+                    name: hello-world
+                    namespace: hello-world
+                  spec:
+                    selector:
+                      app: hello-world
+                    ports:
+                    - protocol: TCP
+                      port: 8080
+                      targetPort: 80
+                  EOF
+
+            - name: Wait for application to be ready
+              run: |
+                  kubectl wait --for=condition=available --timeout=120s \
+                    deployment/hello-world -n hello-world
+                  kubectl get pods -n hello-world
+
+            - name: Create HTTPRoute
+              run: |
+                  cat <<EOF | kubectl apply -f -
+                  apiVersion: gateway.networking.k8s.io/v1
+                  kind: HTTPRoute
+                  metadata:
+                    name: hello-world
+                    namespace: hello-world
+                  spec:
+                    parentRefs:
+                      - name: hello-world-gateway
+                        namespace: hello-world
+                    hostnames:
+                      - "hello.example.com"
+                    rules:
+                      - matches:
+                          - path:
+                              type: PathPrefix
+                              value: /
+                        backendRefs:
+                          - name: hello-world
+                            port: 8080
+                  EOF
+
+            - name: Wait for HTTPRoute to be accepted
+              run: |
+                  timeout 60s bash -c 'until kubectl get httproute hello-world -n hello-world -o jsonpath="{.status.parents[0].conditions[?(@.type==\"Accepted\")].status}" | grep -q "True"; do sleep 2; done' || true
+                  kubectl get httproute hello-world -n hello-world -o yaml
+
+            - name: Verify resources are created
+              run: |
+                  echo "=== GatewayClass ==="
+                  kubectl get gatewayclass cloudflare -o yaml
+
+                  echo -e "\n=== Gateway ==="
+                  kubectl get gateway hello-world-gateway -n hello-world -o yaml
+
+                  echo -e "\n=== HTTPRoute ==="
+                  kubectl get httproute hello-world -n hello-world -o yaml
+
+                  echo -e "\n=== Controller Logs ==="
+                  kubectl logs -n cloudflare-gateway-system deployment/cloudflare-gateway-controller --tail=100
+
+            - name: Check controller health
+              run: |
+                  kubectl get pods -n cloudflare-gateway-system -o wide
+                  kubectl describe deployment cloudflare-gateway-controller -n cloudflare-gateway-system
+
+            - name: Export logs on failure
+              if: failure()
+              run: |
+                  echo "=== All pods ==="
+                  kubectl get pods --all-namespaces
+
+                  echo -e "\n=== Controller logs ==="
+                  kubectl logs -n cloudflare-gateway-system deployment/cloudflare-gateway-controller --tail=200 || true
+
+                  echo -e "\n=== Gateway resources ==="
+                  kubectl get gatewayclasses,gateways,httproutes --all-namespaces -o yaml || true
+
+                  echo -e "\n=== Events ==="
+                  kubectl get events --all-namespaces --sort-by='.lastTimestamp' || true
+
+            - name: Cleanup
+              if: always()
+              run: |
+                  kind delete cluster --name cloudflare-gateway-e2e || true
