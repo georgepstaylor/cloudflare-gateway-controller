@@ -385,6 +385,10 @@ func (r *HTTPRouteReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			&gatewayv1.Gateway{},
 			handler.EnqueueRequestsFromMapFunc(r.findRoutesForGateway),
 		).
+		Watches(
+			&corev1.Service{},
+			handler.EnqueueRequestsFromMapFunc(r.findRoutesForService),
+		).
 		Complete(r)
 }
 
@@ -522,6 +526,45 @@ func hostnameMatches(routeHost, listenerHost string) bool {
 	}
 
 	return false
+}
+
+// findRoutesForService finds all HTTPRoutes that reference a Service as a backend
+func (r *HTTPRouteReconciler) findRoutesForService(ctx context.Context, obj client.Object) []reconcile.Request {
+	service := obj.(*corev1.Service)
+
+	routeList := &gatewayv1.HTTPRouteList{}
+	if err := r.List(ctx, routeList); err != nil {
+		return nil
+	}
+
+	var requests []reconcile.Request
+	for _, route := range routeList.Items {
+		// Check if this route references the service as a backend
+		for _, rule := range route.Spec.Rules {
+			for _, backendRef := range rule.BackendRefs {
+				// Determine backend namespace
+				backendNamespace := route.Namespace
+				if backendRef.Namespace != nil {
+					backendNamespace = string(*backendRef.Namespace)
+				}
+
+				// Check if this backend references our service
+				if string(backendRef.Name) == service.Name && backendNamespace == service.Namespace {
+					requests = append(requests, reconcile.Request{
+						NamespacedName: types.NamespacedName{
+							Name:      route.Name,
+							Namespace: route.Namespace,
+						},
+					})
+					// Move to next route (avoid duplicates)
+					goto nextRoute
+				}
+			}
+		}
+	nextRoute:
+	}
+
+	return requests
 }
 
 // buildOriginRequestConfig constructs OriginRequestConfig from HTTPRoute annotations

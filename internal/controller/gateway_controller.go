@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -558,15 +559,19 @@ func (r *GatewayReconciler) updateGatewayConfigFromRoutes(ctx context.Context, g
 		return fmt.Errorf("failed to list HTTPRoutes: %w", err)
 	}
 
-	// Build ingress rules from all routes
-	var allRules []cloudflare.IngressRule
-	for _, route := range routes {
-		rules, err := r.buildIngressRulesForRoute(ctx, &route)
-		if err != nil {
-			logger.Error(err, "failed to build ingress rules for route", "route", route.Name)
-			continue
+	// Detect conflicts and build ingress rules from non-conflicted routes
+	allRules, conflicts := r.detectConflictsAndBuildRules(ctx, routes)
+
+	// Update conflicted routes' status
+	for routeKey, conflict := range conflicts {
+		for _, route := range routes {
+			key := fmt.Sprintf("%s/%s", route.Namespace, route.Name)
+			if key == routeKey {
+				// This route is conflicted - update its status
+				r.updateConflictedRouteStatus(ctx, &route, conflict)
+				break
+			}
 		}
-		allRules = append(allRules, rules...)
 	}
 
 	// Get tunnel ID from Gateway annotations
@@ -600,6 +605,135 @@ func (r *GatewayReconciler) updateGatewayConfigFromRoutes(ctx context.Context, g
 	logger.Info("updated gateway config", "routes", len(routes), "rules", len(allRules))
 
 	return nil
+}
+
+// routeConflict represents a conflict between HTTPRoutes
+type routeConflict struct {
+	hostname     string
+	path         string
+	conflictWith string // namespace/name of conflicting route
+}
+
+// detectConflictsAndBuildRules builds rules and detects conflicts
+// Returns rules from non-conflicted routes and a map of conflicts
+func (r *GatewayReconciler) detectConflictsAndBuildRules(ctx context.Context, routes []gatewayv1.HTTPRoute) ([]cloudflare.IngressRule, map[string]routeConflict) {
+	logger := log.FromContext(ctx)
+
+	// Track hostname+path to route mapping
+	type routeKey struct {
+		hostname string
+		path     string
+	}
+	routeMap := make(map[routeKey][]string)     // maps hostname+path to list of "namespace/name"
+	conflicts := make(map[string]routeConflict) // maps "namespace/name" to conflict info
+
+	var allRules []cloudflare.IngressRule
+
+	// First pass: build rules and detect conflicts
+	for _, route := range routes {
+		routeName := fmt.Sprintf("%s/%s", route.Namespace, route.Name)
+		rules, err := r.buildIngressRulesForRoute(ctx, &route)
+		if err != nil {
+			logger.Error(err, "failed to build ingress rules for route", "route", route.Name)
+			continue
+		}
+
+		// Track which hostname+path combinations this route claims
+		for _, rule := range rules {
+			key := routeKey{
+				hostname: rule.Hostname,
+				path:     rule.Path,
+			}
+			routeMap[key] = append(routeMap[key], routeName)
+		}
+	}
+
+	// Second pass: identify conflicts (any hostname+path with >1 route)
+	for key, routeNames := range routeMap {
+		if len(routeNames) > 1 {
+			// Conflict! Mark all routes claiming this hostname+path as conflicted
+			for _, routeName := range routeNames {
+				otherRoutes := make([]string, 0, len(routeNames)-1)
+				for _, other := range routeNames {
+					if other != routeName {
+						otherRoutes = append(otherRoutes, other)
+					}
+				}
+				conflicts[routeName] = routeConflict{
+					hostname:     key.hostname,
+					path:         key.path,
+					conflictWith: strings.Join(otherRoutes, ", "),
+				}
+				logger.Info("route conflict detected - all conflicting routes will be rejected",
+					"route", routeName,
+					"conflictsWith", otherRoutes,
+					"hostname", key.hostname,
+					"path", key.path)
+			}
+		}
+	}
+
+	// Third pass: add rules only from non-conflicted routes
+	for _, route := range routes {
+		routeName := fmt.Sprintf("%s/%s", route.Namespace, route.Name)
+		if _, isConflicted := conflicts[routeName]; !isConflicted {
+			rules, err := r.buildIngressRulesForRoute(ctx, &route)
+			if err != nil {
+				continue
+			}
+			allRules = append(allRules, rules...)
+		}
+	}
+
+	return allRules, conflicts
+}
+
+// updateConflictedRouteStatus updates the status of a conflicted route
+func (r *GatewayReconciler) updateConflictedRouteStatus(ctx context.Context, route *gatewayv1.HTTPRoute, conflict routeConflict) {
+	logger := log.FromContext(ctx)
+
+	// Find the parent ref index (just use first one for simplicity)
+	if len(route.Spec.ParentRefs) == 0 {
+		return
+	}
+
+	// Get the latest version of the route
+	latestRoute := &gatewayv1.HTTPRoute{}
+	if err := r.Get(ctx, types.NamespacedName{
+		Name:      route.Name,
+		Namespace: route.Namespace,
+	}, latestRoute); err != nil {
+		logger.Error(err, "failed to get route for status update", "route", route.Name)
+		return
+	}
+
+	// Set conflicted status condition
+	message := fmt.Sprintf("Route rejected due to conflict with %s for hostname=%s path=%s. All conflicting routes are rejected until the conflict is resolved.",
+		conflict.conflictWith, conflict.hostname, conflict.path)
+
+	// Update status for first parent (simplified - should update all parents)
+	if len(latestRoute.Status.Parents) == 0 {
+		latestRoute.Status.Parents = make([]gatewayv1.RouteParentStatus, 1)
+		latestRoute.Status.Parents[0] = gatewayv1.RouteParentStatus{
+			ParentRef:      latestRoute.Spec.ParentRefs[0],
+			ControllerName: controllerName,
+		}
+	}
+
+	condition := metav1.Condition{
+		Type:               string(gatewayv1.RouteConditionAccepted),
+		Status:             metav1.ConditionFalse,
+		ObservedGeneration: latestRoute.Generation,
+		LastTransitionTime: metav1.Now(),
+		Reason:             "Conflicted",
+		Message:            message,
+	}
+
+	meta.SetStatusCondition(&latestRoute.Status.Parents[0].Conditions, condition)
+
+	if err := r.Status().Update(ctx, latestRoute); err != nil {
+		logger.Error(err, "failed to update conflicted route status", "route", route.Name)
+	}
 }
 
 // buildOriginRequestConfigForRoute constructs OriginRequestConfig from HTTPRoute annotations
