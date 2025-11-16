@@ -14,6 +14,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 
@@ -28,7 +29,8 @@ const (
 // GatewayReconciler reconciles a Gateway object
 type GatewayReconciler struct {
 	client.Client
-	Scheme *runtime.Scheme
+	Scheme        *runtime.Scheme
+	ClusterDomain string
 }
 
 //+kubebuilder:rbac:groups=gateway.networking.k8s.io,resources=gateways,verbs=get;list;watch;create;update;patch;delete
@@ -79,6 +81,15 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	if gatewayClass.Spec.ControllerName != controllerName {
 		logger.Info("gateway class not owned by this controller", "controller", gatewayClass.Spec.ControllerName)
 		return ctrl.Result{}, nil
+	}
+
+	// Validate listeners configuration
+	if err := r.validateListeners(gateway); err != nil {
+		logger.Error(err, "invalid listeners configuration")
+		r.setGatewayCondition(gateway, gatewayv1.GatewayConditionAccepted, metav1.ConditionFalse,
+			gatewayv1.GatewayReasonListenersNotValid, err.Error())
+		_ = r.Status().Update(ctx, gateway)
+		return ctrl.Result{}, err
 	}
 
 	// Get Cloudflare credentials from GatewayClass parameters
@@ -151,11 +162,23 @@ func (r *GatewayReconciler) reconcileGateway(ctx context.Context, gateway *gatew
 		return fmt.Errorf("failed to reconcile deployment: %w", err)
 	}
 
+	// Update Gateway ConfigMap with all HTTPRoute rules
+	if err := r.updateGatewayConfigFromRoutes(ctx, gateway); err != nil {
+		logger.Error(err, "failed to update gateway config from routes")
+		// Don't fail reconciliation - config will be updated when routes change
+	}
+
 	// Update Gateway status
 	r.setGatewayCondition(gateway, gatewayv1.GatewayConditionAccepted, metav1.ConditionTrue,
 		gatewayv1.GatewayReasonAccepted, "Gateway accepted")
 	r.setGatewayCondition(gateway, gatewayv1.GatewayConditionProgrammed, metav1.ConditionTrue,
 		gatewayv1.GatewayReasonProgrammed, "Gateway programmed")
+
+	// Update listener status with actual attached route counts
+	if err := r.updateListenerStatus(ctx, gateway); err != nil {
+		logger.Error(err, "failed to update listener status")
+		// Don't fail reconciliation
+	}
 
 	// Set the tunnel hostname as the gateway address
 	tunnelID = gateway.Annotations["george.dev/tunnel-id"]
@@ -169,6 +192,98 @@ func (r *GatewayReconciler) reconcileGateway(ctx context.Context, gateway *gatew
 	}
 
 	return r.Status().Update(ctx, gateway)
+}
+
+// updateListenerStatus counts attached routes per listener and updates status
+func (r *GatewayReconciler) updateListenerStatus(ctx context.Context, gateway *gatewayv1.Gateway) error {
+	// Get all HTTPRoutes for this Gateway
+	routes, err := r.getAllHTTPRoutesForGateway(ctx, gateway)
+	if err != nil {
+		return err
+	}
+
+	// Initialize listener status
+	gateway.Status.Listeners = make([]gatewayv1.ListenerStatus, len(gateway.Spec.Listeners))
+
+	for i, listener := range gateway.Spec.Listeners {
+		// Count routes attached to this listener
+		attachedCount := int32(0)
+		for _, route := range routes {
+			if r.routeMatchesListener(&route, gateway, listener) {
+				attachedCount++
+			}
+		}
+
+		gateway.Status.Listeners[i] = gatewayv1.ListenerStatus{
+			Name: listener.Name,
+			SupportedKinds: []gatewayv1.RouteGroupKind{
+				{
+					Group: ptrTo(gatewayv1.Group(gatewayv1.GroupName)),
+					Kind:  "HTTPRoute",
+				},
+			},
+			AttachedRoutes: attachedCount,
+			Conditions: []metav1.Condition{
+				{
+					Type:               string(gatewayv1.ListenerConditionAccepted),
+					Status:             metav1.ConditionTrue,
+					ObservedGeneration: gateway.Generation,
+					LastTransitionTime: metav1.Now(),
+					Reason:             string(gatewayv1.ListenerReasonAccepted),
+					Message:            "Listener accepted",
+				},
+				{
+					Type:               string(gatewayv1.ListenerConditionProgrammed),
+					Status:             metav1.ConditionTrue,
+					ObservedGeneration: gateway.Generation,
+					LastTransitionTime: metav1.Now(),
+					Reason:             string(gatewayv1.ListenerReasonProgrammed),
+					Message:            "Listener programmed",
+				},
+			},
+		}
+	}
+
+	return nil
+}
+
+// routeMatchesListener checks if an HTTPRoute matches a specific listener
+func (r *GatewayReconciler) routeMatchesListener(route *gatewayv1.HTTPRoute, gateway *gatewayv1.Gateway, listener gatewayv1.Listener) bool {
+	// Check if route references this gateway
+	for _, parentRef := range route.Spec.ParentRefs {
+		parentNamespace := route.Namespace
+		if parentRef.Namespace != nil {
+			parentNamespace = string(*parentRef.Namespace)
+		}
+
+		// Must reference this gateway
+		if string(parentRef.Name) != gateway.Name || parentNamespace != gateway.Namespace {
+			continue
+		}
+
+		// If sectionName specified, must match listener name
+		if parentRef.SectionName != nil {
+			if *parentRef.SectionName == listener.Name {
+				return true
+			}
+			continue
+		}
+
+		// If port specified, must match listener port
+		if parentRef.Port != nil {
+			if *parentRef.Port == listener.Port {
+				return true
+			}
+			continue
+		}
+
+		// No sectionName or port - matches any HTTP/HTTPS listener
+		if listener.Protocol == gatewayv1.HTTPProtocolType || listener.Protocol == gatewayv1.HTTPSProtocolType {
+			return true
+		}
+	}
+
+	return false
 }
 
 func (r *GatewayReconciler) reconcileCredentialsSecret(ctx context.Context, gateway *gatewayv1.Gateway, cfClient *cloudflare.Client) error {
@@ -320,6 +435,236 @@ func (r *GatewayReconciler) reconcileDeployment(ctx context.Context, gateway *ga
 	return err
 }
 
+// getAllHTTPRoutesForGateway lists all HTTPRoutes that reference this Gateway
+func (r *GatewayReconciler) getAllHTTPRoutesForGateway(ctx context.Context, gateway *gatewayv1.Gateway) ([]gatewayv1.HTTPRoute, error) {
+	// List all HTTPRoutes across all namespaces
+	routeList := &gatewayv1.HTTPRouteList{}
+	if err := r.List(ctx, routeList); err != nil {
+		return nil, err
+	}
+
+	var matchingRoutes []gatewayv1.HTTPRoute
+
+	for _, route := range routeList.Items {
+		// Check if this route references our gateway
+		for _, parentRef := range route.Spec.ParentRefs {
+			parentNamespace := route.Namespace // default to route's namespace
+			if parentRef.Namespace != nil {
+				parentNamespace = string(*parentRef.Namespace)
+			}
+			if string(parentRef.Name) == gateway.Name && parentNamespace == gateway.Namespace {
+				matchingRoutes = append(matchingRoutes, route)
+				break
+			}
+		}
+	}
+
+	return matchingRoutes, nil
+}
+
+// buildIngressRulesForRoute builds cloudflared ingress rules for a single HTTPRoute
+func (r *GatewayReconciler) buildIngressRulesForRoute(ctx context.Context, route *gatewayv1.HTTPRoute) ([]cloudflare.IngressRule, error) {
+	builder := cloudflare.NewIngressRuleBuilder()
+
+	// Get hostnames from the route
+	hostnames := route.Spec.Hostnames
+	if len(hostnames) == 0 {
+		// Skip routes with no hostnames
+		return nil, nil
+	}
+
+	// Process each rule in the HTTPRoute
+	for _, rule := range route.Spec.Rules {
+		// Get the first backend (for simplicity, we only support one backend per rule)
+		if len(rule.BackendRefs) == 0 {
+			continue
+		}
+
+		backendRef := rule.BackendRefs[0]
+
+		// Resolve backend Service
+		serviceName := string(backendRef.Name)
+		serviceNamespace := route.Namespace
+		if backendRef.Namespace != nil {
+			serviceNamespace = string(*backendRef.Namespace)
+		}
+
+		// Get Service to verify it exists
+		service := &corev1.Service{}
+		if err := r.Get(ctx, types.NamespacedName{
+			Name:      serviceName,
+			Namespace: serviceNamespace,
+		}, service); err != nil {
+			// Skip this rule if service doesn't exist
+			continue
+		}
+
+		// Determine the port
+		var port int32
+		if backendRef.Port != nil {
+			port = int32(*backendRef.Port)
+		} else if len(service.Spec.Ports) > 0 {
+			port = service.Spec.Ports[0].Port
+		} else {
+			continue
+		}
+
+		serviceURL := cloudflare.ServiceURL(serviceName, serviceNamespace, port, r.ClusterDomain)
+
+		// Check if service uses HTTPS (via annotation or port)
+		scheme := "http"
+		if route.Annotations["cloudflare-gateway-controller.github.com/backend-protocol"] == "https" {
+			scheme = "https"
+		} else if port == 443 || port == 8443 {
+			// Auto-detect HTTPS for common HTTPS ports
+			scheme = "https"
+		}
+
+		if scheme == "https" {
+			serviceURL = cloudflare.ServiceURLWithScheme("https", serviceName, serviceNamespace, port, r.ClusterDomain)
+		}
+
+		// Build origin request config from annotations
+		originRequest := r.buildOriginRequestConfigForRoute(route, scheme)
+
+		// Create ingress rules for each hostname and path match
+		for _, hostname := range hostnames {
+			if len(rule.Matches) == 0 {
+				// No matches means match all paths for this hostname
+				builder.AddRule(string(hostname), "", serviceURL, originRequest)
+			} else {
+				// Create a rule for each path match
+				for _, match := range rule.Matches {
+					path := ""
+					if match.Path != nil && match.Path.Value != nil {
+						path = *match.Path.Value
+					}
+					builder.AddRule(string(hostname), path, serviceURL, originRequest)
+				}
+			}
+		}
+	}
+
+	return builder.Build(), nil
+}
+
+// updateGatewayConfigFromRoutes aggregates all HTTPRoutes and updates the Gateway's ConfigMap
+func (r *GatewayReconciler) updateGatewayConfigFromRoutes(ctx context.Context, gateway *gatewayv1.Gateway) error {
+	logger := log.FromContext(ctx)
+
+	// Get all HTTPRoutes for this Gateway
+	routes, err := r.getAllHTTPRoutesForGateway(ctx, gateway)
+	if err != nil {
+		return fmt.Errorf("failed to list HTTPRoutes: %w", err)
+	}
+
+	// Build ingress rules from all routes
+	var allRules []cloudflare.IngressRule
+	for _, route := range routes {
+		rules, err := r.buildIngressRulesForRoute(ctx, &route)
+		if err != nil {
+			logger.Error(err, "failed to build ingress rules for route", "route", route.Name)
+			continue
+		}
+		allRules = append(allRules, rules...)
+	}
+
+	// Get tunnel ID from Gateway annotations
+	tunnelID := gateway.Annotations["george.dev/tunnel-id"]
+	if tunnelID == "" {
+		return fmt.Errorf("gateway has no tunnel-id annotation")
+	}
+
+	// Generate new config
+	generator := cloudflare.NewConfigGenerator()
+	config, err := generator.GenerateConfig(tunnelID, allRules)
+	if err != nil {
+		return fmt.Errorf("failed to generate config: %w", err)
+	}
+
+	// Update ConfigMap
+	configMapName := fmt.Sprintf("%s-tunnel-config", gateway.Name)
+	configMap := &corev1.ConfigMap{}
+	if err := r.Get(ctx, types.NamespacedName{
+		Name:      configMapName,
+		Namespace: gateway.Namespace,
+	}, configMap); err != nil {
+		return fmt.Errorf("failed to get configmap: %w", err)
+	}
+
+	configMap.Data["config.yaml"] = config
+	if err := r.Update(ctx, configMap); err != nil {
+		return fmt.Errorf("failed to update configmap: %w", err)
+	}
+
+	logger.Info("updated gateway config", "routes", len(routes), "rules", len(allRules))
+
+	return nil
+}
+
+// buildOriginRequestConfigForRoute constructs OriginRequestConfig from HTTPRoute annotations
+func (r *GatewayReconciler) buildOriginRequestConfigForRoute(route *gatewayv1.HTTPRoute, scheme string) *cloudflare.OriginRequestConfig {
+	annotations := route.Annotations
+	if annotations == nil {
+		return nil
+	}
+
+	// Legacy individual annotation support
+	config := &cloudflare.OriginRequestConfig{}
+	hasConfig := false
+
+	// Simple helper to set string fields
+	setString := func(dest *string, key string) {
+		if val := annotations[key]; val != "" {
+			*dest = val
+			hasConfig = true
+		}
+	}
+
+	// Simple helper to set bool fields
+	setBool := func(dest *bool, key string) {
+		if annotations[key] == "true" {
+			*dest = true
+			hasConfig = true
+		}
+	}
+
+	// TLS Settings
+	setString(&config.OriginServerName, "cloudflare-gateway-controller.github.com/origin-server-name")
+	setBool(&config.MatchSNItoHost, "cloudflare-gateway-controller.github.com/match-sni-to-host")
+	setString(&config.CAPool, "cloudflare-gateway-controller.github.com/ca-pool")
+	setString(&config.TLSTimeout, "cloudflare-gateway-controller.github.com/tls-timeout")
+	setBool(&config.HTTP2Origin, "cloudflare-gateway-controller.github.com/http2-origin")
+
+	if annotations["cloudflare-gateway-controller.github.com/no-tls-verify"] == "true" {
+		config.NoTLSVerify = true
+		hasConfig = true
+	} else if scheme == "https" && annotations["cloudflare-gateway-controller.github.com/no-tls-verify"] == "" {
+		// Default to noTLSVerify for HTTPS backends (self-signed certs)
+		config.NoTLSVerify = true
+		hasConfig = true
+	}
+
+	// HTTP Settings
+	setString(&config.HTTPHostHeader, "cloudflare-gateway-controller.github.com/http-host-header")
+	setBool(&config.DisableChunkedEncoding, "cloudflare-gateway-controller.github.com/disable-chunked-encoding")
+
+	// Connection Settings
+	setString(&config.ConnectTimeout, "cloudflare-gateway-controller.github.com/connect-timeout")
+	setBool(&config.NoHappyEyeballs, "cloudflare-gateway-controller.github.com/no-happy-eyeballs")
+	setString(&config.KeepAliveTimeout, "cloudflare-gateway-controller.github.com/keep-alive-timeout")
+	setBool(&config.TCPKeepAlive, "cloudflare-gateway-controller.github.com/tcp-keep-alive")
+
+	// Access Settings
+	setBool(&config.Required, "cloudflare-gateway-controller.github.com/access-required")
+
+	if !hasConfig {
+		return nil
+	}
+
+	return config
+}
+
 func (r *GatewayReconciler) handleDeletion(ctx context.Context, gateway *gatewayv1.Gateway) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
@@ -381,6 +726,45 @@ func (r *GatewayReconciler) getCloudflareClient(ctx context.Context, gatewayClas
 	return cloudflare.NewClient(apiToken, accountID)
 }
 
+func (r *GatewayReconciler) validateListeners(gateway *gatewayv1.Gateway) error {
+	if len(gateway.Spec.Listeners) == 0 {
+		return fmt.Errorf("gateway must have at least one listener")
+	}
+
+	for i, listener := range gateway.Spec.Listeners {
+		// Validate protocol - only HTTP and HTTPS are supported for Cloudflare Tunnels
+		switch listener.Protocol {
+		case gatewayv1.HTTPProtocolType, gatewayv1.HTTPSProtocolType:
+			// Supported protocols
+		case gatewayv1.TLSProtocolType, gatewayv1.TCPProtocolType, gatewayv1.UDPProtocolType:
+			return fmt.Errorf("listener[%d]: protocol %s not supported (only HTTP and HTTPS)", i, listener.Protocol)
+		default:
+			return fmt.Errorf("listener[%d]: unknown protocol %s", i, listener.Protocol)
+		}
+
+		// Validate port is set
+		if listener.Port == 0 {
+			return fmt.Errorf("listener[%d]: port must be specified", i)
+		}
+
+		// HTTPS listeners should have TLS configuration
+		if listener.Protocol == gatewayv1.HTTPSProtocolType {
+			if listener.TLS == nil {
+				return fmt.Errorf("listener[%d]: HTTPS protocol requires TLS configuration", i)
+			}
+			// Note: For Cloudflare Tunnels, TLS is terminated at the edge
+			// But we validate the config is present for spec compliance
+		}
+
+		// Validate listener name is set
+		if listener.Name == "" {
+			return fmt.Errorf("listener[%d]: name must be specified", i)
+		}
+	}
+
+	return nil
+}
+
 func (r *GatewayReconciler) setGatewayCondition(gateway *gatewayv1.Gateway, condType gatewayv1.GatewayConditionType,
 	status metav1.ConditionStatus, reason gatewayv1.GatewayConditionReason, message string) {
 
@@ -396,6 +780,30 @@ func (r *GatewayReconciler) setGatewayCondition(gateway *gatewayv1.Gateway, cond
 	meta.SetStatusCondition(&gateway.Status.Conditions, condition)
 }
 
+// findGatewaysForHTTPRoute finds all Gateways that an HTTPRoute references
+func (r *GatewayReconciler) findGatewaysForHTTPRoute(ctx context.Context, obj client.Object) []ctrl.Request {
+	route := obj.(*gatewayv1.HTTPRoute)
+
+	var requests []ctrl.Request
+	for _, parentRef := range route.Spec.ParentRefs {
+		// Determine Gateway namespace
+		gatewayNamespace := route.Namespace
+		if parentRef.Namespace != nil {
+			gatewayNamespace = string(*parentRef.Namespace)
+		}
+
+		// Add reconcile request for this Gateway
+		requests = append(requests, ctrl.Request{
+			NamespacedName: types.NamespacedName{
+				Name:      string(parentRef.Name),
+				Namespace: gatewayNamespace,
+			},
+		})
+	}
+
+	return requests
+}
+
 // SetupWithManager sets up the controller with the Manager.
 func (r *GatewayReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
@@ -403,6 +811,10 @@ func (r *GatewayReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&appsv1.Deployment{}).
 		Owns(&corev1.ConfigMap{}).
 		Owns(&corev1.Secret{}).
+		Watches(
+			&gatewayv1.HTTPRoute{},
+			handler.EnqueueRequestsFromMapFunc(r.findGatewaysForHTTPRoute),
+		).
 		Complete(r)
 }
 
