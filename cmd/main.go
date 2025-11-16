@@ -16,6 +16,8 @@ import (
 	"github.com/georgetaylor/cloudflare-gateway-controller/internal/controller"
 )
 
+//+kubebuilder:rbac:groups="",resources=events,verbs=create;patch
+
 var (
 	scheme   = runtime.NewScheme()
 	setupLog = ctrl.Log.WithName("setup")
