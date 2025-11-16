@@ -274,9 +274,32 @@ jobs:
                   helm list -n cloudflare-gateway-system
                   kubectl describe deployment -n cloudflare-gateway-system -l app.kubernetes.io/name=cloudflare-gateway-controller
 
+            - name: Check cloudflared tunnel deployment
+              run: |
+                  echo "=== Cloudflared Deployment ==="
+                  kubectl get deployments -n hello-world
+                  kubectl get pods -n hello-world -l app=cloudflared -o wide || echo "No cloudflared pods found"
+
+                  echo -e "\n=== Cloudflared Logs ==="
+                  kubectl logs -n hello-world -l app=cloudflared --tail=50 || echo "No cloudflared logs available"
+
+                  echo -e "\n=== ConfigMaps ==="
+                  kubectl get configmaps -n hello-world
+                  kubectl describe configmap -n hello-world || true
+
+            - name: Test internal service connectivity
+              run: |
+                  echo "=== Testing service from within cluster ==="
+                  kubectl run curl-test --image=curlimages/curl:latest --rm -i --restart=Never -n hello-world -- \
+                    curl -v http://hello-world.hello-world.svc.cluster.local:8080 --max-time 5 || echo "Internal service test failed"
+
             - name: Test public access to application
               run: |
-                  curl -L https://cfgc.george.dev -H "Host: cfgc.george.dev" --max-time 10
+                  echo "=== Testing public HTTPS access ==="
+                  curl -v https://cfgc.george.dev --max-time 10 || echo "Public access failed with exit code $?"
+
+                  echo -e "\n=== DNS Resolution ==="
+                  dig cfgc.george.dev || true
 
             - name: Export logs on failure
               if: failure()
