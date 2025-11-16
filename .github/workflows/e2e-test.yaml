@@ -238,7 +238,7 @@ jobs:
                       - name: hello-world-gateway
                         namespace: hello-world
                     hostnames:
-                      - "hello.example.com"
+                      - "cfgc.george.dev"
                     rules:
                       - matches:
                           - path:
