@@ -108,6 +108,14 @@ func (r *HTTPRouteReconciler) reconcileParentGateway(ctx context.Context, route 
 		return nil
 	}
 
+	// Validate HTTPRoute matches a listener
+	if err := r.validateRouteMatchesListener(route, gateway, parentRef); err != nil {
+		r.setRouteCondition(route, parentIndex, gatewayv1.RouteConditionAccepted, metav1.ConditionFalse,
+			gatewayv1.RouteReasonNotAllowedByListeners, err.Error())
+		_ = r.Status().Update(ctx, route)
+		return err
+	}
+
 	// Get Cloudflare client
 	cfClient, err := r.getCloudflareClient(ctx, gatewayClass)
 	if err != nil {
@@ -117,21 +125,13 @@ func (r *HTTPRouteReconciler) reconcileParentGateway(ctx context.Context, route 
 		return fmt.Errorf("failed to get cloudflare client: %w", err)
 	}
 
-	// Build ingress rules from HTTPRoute
-	ingressRules, err := r.buildIngressRules(ctx, route)
+	// Validate backend references by building ingress rules (don't actually use them)
+	_, err = r.buildIngressRules(ctx, route)
 	if err != nil {
 		r.setRouteCondition(route, parentIndex, gatewayv1.RouteConditionResolvedRefs, metav1.ConditionFalse,
 			gatewayv1.RouteReasonBackendNotFound, err.Error())
 		_ = r.Status().Update(ctx, route)
-		return fmt.Errorf("failed to build ingress rules: %w", err)
-	}
-
-	// Update Gateway's ConfigMap with new ingress rules
-	if err := r.updateGatewayConfig(ctx, gateway, ingressRules); err != nil {
-		r.setRouteCondition(route, parentIndex, gatewayv1.RouteConditionAccepted, metav1.ConditionFalse,
-			gatewayv1.RouteReasonNoMatchingParent, "Failed to update Gateway configuration")
-		_ = r.Status().Update(ctx, route)
-		return fmt.Errorf("failed to update gateway config: %w", err)
+		return fmt.Errorf("failed to resolve backend refs: %w", err)
 	}
 
 	// Create DNS records for each hostname
@@ -145,6 +145,9 @@ func (r *HTTPRouteReconciler) reconcileParentGateway(ctx context.Context, route 
 		gatewayv1.RouteReasonAccepted, "Route accepted")
 	r.setRouteCondition(route, parentIndex, gatewayv1.RouteConditionResolvedRefs, metav1.ConditionTrue,
 		gatewayv1.RouteReasonResolvedRefs, "All references resolved")
+
+	// Note: Gateway controller will update its ConfigMap when it reconciles
+	// due to the watch on HTTPRoute changes
 
 	return r.Status().Update(ctx, route)
 }
@@ -231,89 +234,6 @@ func (r *HTTPRouteReconciler) buildIngressRules(ctx context.Context, route *gate
 	}
 
 	return builder.Build(), nil
-}
-
-func (r *HTTPRouteReconciler) updateGatewayConfig(ctx context.Context, gateway *gatewayv1.Gateway, newRules []cloudflare.IngressRule) error {
-	// Get all HTTPRoutes for this Gateway to collect all rules
-	allRules, err := r.getAllIngressRulesForGateway(ctx, gateway)
-	if err != nil {
-		return fmt.Errorf("failed to get all ingress rules: %w", err)
-	}
-
-	// allRules already contains all routes including the current one being reconciled
-	// No need to append newRules since getAllIngressRulesForGateway collects everything
-
-	// Get tunnel ID from Gateway annotations
-	tunnelID := gateway.Annotations["george.dev/tunnel-id"]
-	if tunnelID == "" {
-		return fmt.Errorf("gateway has no tunnel-id annotation")
-	}
-
-	// Generate new config
-	generator := cloudflare.NewConfigGenerator()
-	config, err := generator.GenerateConfig(tunnelID, allRules)
-	if err != nil {
-		return fmt.Errorf("failed to generate config: %w", err)
-	}
-
-	// Update ConfigMap
-	configMapName := fmt.Sprintf("%s-tunnel-config", gateway.Name)
-	configMap := &corev1.ConfigMap{}
-	if err := r.Get(ctx, types.NamespacedName{
-		Name:      configMapName,
-		Namespace: gateway.Namespace,
-	}, configMap); err != nil {
-		return fmt.Errorf("failed to get configmap: %w", err)
-	}
-
-	configMap.Data["config.yaml"] = config
-	if err := r.Update(ctx, configMap); err != nil {
-		return fmt.Errorf("failed to update configmap: %w", err)
-	}
-
-	// TODO: Trigger cloudflared pod restart/reload
-
-	return nil
-}
-
-func (r *HTTPRouteReconciler) getAllIngressRulesForGateway(ctx context.Context, gateway *gatewayv1.Gateway) ([]cloudflare.IngressRule, error) {
-	// List all HTTPRoutes across all namespaces
-	routeList := &gatewayv1.HTTPRouteList{}
-	if err := r.List(ctx, routeList); err != nil {
-		return nil, err
-	}
-
-	var allRules []cloudflare.IngressRule
-
-	for _, route := range routeList.Items {
-		// Check if this route references our gateway
-		referencesGateway := false
-		for _, parentRef := range route.Spec.ParentRefs {
-			parentNamespace := route.Namespace // default to route's namespace
-			if parentRef.Namespace != nil {
-				parentNamespace = string(*parentRef.Namespace)
-			}
-			if string(parentRef.Name) == gateway.Name && parentNamespace == gateway.Namespace {
-				referencesGateway = true
-				break
-			}
-		}
-
-		if !referencesGateway {
-			continue
-		}
-
-		// Build rules for this route
-		rules, err := r.buildIngressRules(ctx, &route)
-		if err != nil {
-			// Skip routes that have errors
-			continue
-		}
-
-		allRules = append(allRules, rules...)
-	}
-
-	return allRules, nil
 }
 
 func (r *HTTPRouteReconciler) reconcileDNSRecords(ctx context.Context, route *gatewayv1.HTTPRoute, gateway *gatewayv1.Gateway, cfClient *cloudflare.Client) error {
@@ -465,6 +385,10 @@ func (r *HTTPRouteReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			&gatewayv1.Gateway{},
 			handler.EnqueueRequestsFromMapFunc(r.findRoutesForGateway),
 		).
+		Watches(
+			&corev1.Service{},
+			handler.EnqueueRequestsFromMapFunc(r.findRoutesForService),
+		).
 		Complete(r)
 }
 
@@ -490,6 +414,154 @@ func (r *HTTPRouteReconciler) findRoutesForGateway(ctx context.Context, obj clie
 				break
 			}
 		}
+	}
+
+	return requests
+}
+
+// validateRouteMatchesListener checks if the HTTPRoute matches a listener on the Gateway
+func (r *HTTPRouteReconciler) validateRouteMatchesListener(route *gatewayv1.HTTPRoute, gateway *gatewayv1.Gateway, parentRef gatewayv1.ParentReference) error {
+	// If parentRef specifies a sectionName, find that specific listener
+	if parentRef.SectionName != nil {
+		found := false
+		for _, listener := range gateway.Spec.Listeners {
+			if listener.Name == *parentRef.SectionName {
+				found = true
+				// Validate protocol compatibility
+				if listener.Protocol != gatewayv1.HTTPProtocolType && listener.Protocol != gatewayv1.HTTPSProtocolType {
+					return fmt.Errorf("listener %s has protocol %s which is incompatible with HTTPRoute", listener.Name, listener.Protocol)
+				}
+				// Validate hostnames if listener has hostname restrictions
+				if err := r.validateHostnameMatch(route, listener); err != nil {
+					return err
+				}
+				break
+			}
+		}
+		if !found {
+			return fmt.Errorf("no listener with name %s found on gateway", *parentRef.SectionName)
+		}
+	} else if parentRef.Port != nil {
+		// If parentRef specifies a port, find listener with that port
+		found := false
+		for _, listener := range gateway.Spec.Listeners {
+			if listener.Port == *parentRef.Port {
+				found = true
+				// Validate protocol compatibility
+				if listener.Protocol != gatewayv1.HTTPProtocolType && listener.Protocol != gatewayv1.HTTPSProtocolType {
+					return fmt.Errorf("listener on port %d has protocol %s which is incompatible with HTTPRoute", listener.Port, listener.Protocol)
+				}
+				// Validate hostnames if listener has hostname restrictions
+				if err := r.validateHostnameMatch(route, listener); err != nil {
+					return err
+				}
+				break
+			}
+		}
+		if !found {
+			return fmt.Errorf("no listener with port %d found on gateway", *parentRef.Port)
+		}
+	} else {
+		// No sectionName or port specified - match any HTTP/HTTPS listener
+		found := false
+		for _, listener := range gateway.Spec.Listeners {
+			if listener.Protocol == gatewayv1.HTTPProtocolType || listener.Protocol == gatewayv1.HTTPSProtocolType {
+				// Validate hostnames if listener has hostname restrictions
+				if err := r.validateHostnameMatch(route, listener); err != nil {
+					continue // Try next listener
+				}
+				found = true
+				break
+			}
+		}
+		if !found {
+			return fmt.Errorf("no matching HTTP/HTTPS listener found on gateway")
+		}
+	}
+	return nil
+}
+
+// validateHostnameMatch checks if route hostnames are allowed by listener hostname
+func (r *HTTPRouteReconciler) validateHostnameMatch(route *gatewayv1.HTTPRoute, listener gatewayv1.Listener) error {
+	if listener.Hostname == nil || *listener.Hostname == "" {
+		// No hostname restriction on listener - all route hostnames allowed
+		return nil
+	}
+
+	listenerHostname := string(*listener.Hostname)
+
+	// If route has no hostnames, it would match all - check if listener allows that
+	if len(route.Spec.Hostnames) == 0 {
+		// This is problematic - route matches all but listener is restricted
+		return fmt.Errorf("route has no hostnames but listener restricts to %s", listenerHostname)
+	}
+
+	// Check each route hostname matches listener hostname
+	for _, routeHostname := range route.Spec.Hostnames {
+		if !hostnameMatches(string(routeHostname), listenerHostname) {
+			return fmt.Errorf("route hostname %s does not match listener hostname %s", routeHostname, listenerHostname)
+		}
+	}
+
+	return nil
+}
+
+// hostnameMatches checks if a route hostname matches a listener hostname (supports wildcards)
+func hostnameMatches(routeHost, listenerHost string) bool {
+	// Exact match
+	if routeHost == listenerHost {
+		return true
+	}
+
+	// Wildcard matching: listener "*.example.com" matches route "api.example.com"
+	if strings.HasPrefix(listenerHost, "*.") {
+		domain := listenerHost[2:]
+		return strings.HasSuffix(routeHost, "."+domain) || routeHost == domain
+	}
+
+	// Wildcard matching: route "*.example.com" must be more specific than listener
+	if strings.HasPrefix(routeHost, "*.") {
+		// Route wildcards must be subset of listener
+		return routeHost == listenerHost
+	}
+
+	return false
+}
+
+// findRoutesForService finds all HTTPRoutes that reference a Service as a backend
+func (r *HTTPRouteReconciler) findRoutesForService(ctx context.Context, obj client.Object) []reconcile.Request {
+	service := obj.(*corev1.Service)
+
+	routeList := &gatewayv1.HTTPRouteList{}
+	if err := r.List(ctx, routeList); err != nil {
+		return nil
+	}
+
+	var requests []reconcile.Request
+	for _, route := range routeList.Items {
+		// Check if this route references the service as a backend
+		for _, rule := range route.Spec.Rules {
+			for _, backendRef := range rule.BackendRefs {
+				// Determine backend namespace
+				backendNamespace := route.Namespace
+				if backendRef.Namespace != nil {
+					backendNamespace = string(*backendRef.Namespace)
+				}
+
+				// Check if this backend references our service
+				if string(backendRef.Name) == service.Name && backendNamespace == service.Namespace {
+					requests = append(requests, reconcile.Request{
+						NamespacedName: types.NamespacedName{
+							Name:      route.Name,
+							Namespace: route.Namespace,
+						},
+					})
+					// Move to next route (avoid duplicates)
+					goto nextRoute
+				}
+			}
+		}
+	nextRoute:
 	}
 
 	return requests

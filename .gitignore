@@ -40,3 +40,5 @@ config/crd/bases
 # Docker
 *.tar
 config/rbac/role.yaml
+
+examples/
