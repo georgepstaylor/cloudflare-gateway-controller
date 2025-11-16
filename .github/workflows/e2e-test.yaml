@@ -202,13 +202,14 @@ jobs:
                           app: hello-world
                       spec:
                         containers:
-                        - name: echo-server
-                          image: ealen/echo-server:latest
+                        - name: hello-world
+                          image: gcr.io/google-samples/hello-app:1.0
                           ports:
-                          - containerPort: 80
+                            - containerPort: 8080
+                              name: http
                           env:
-                          - name: PORT
-                            value: "80"
+                            - name: PORT
+                              value: "8080"
                   ---
                   apiVersion: v1
                   kind: Service
@@ -221,7 +222,7 @@ jobs:
                     ports:
                     - protocol: TCP
                       port: 8080
-                      targetPort: 80
+                      targetPort: 8080
                   EOF
 
             - name: Wait for application to be ready
@@ -259,19 +260,23 @@ jobs:
                   timeout 60s bash -c 'until kubectl get httproute hello-world-${{ steps.e2e-id.outputs.E2E_ID }} -n hello-world -o jsonpath="{.status.parents[0].conditions[?(@.type==\"Accepted\")].status}" | grep -q "True"; do sleep 2; done' || true
                   kubectl get httproute hello-world-${{ steps.e2e-id.outputs.E2E_ID }} -n hello-world -o yaml
 
-            - name: Wait for tunnel configuration to update
+            - name: Wait for cloudflared to pick up route changes
               run: |
-                  echo "Waiting 30 seconds for cloudflared to pick up route changes..."
-                  sleep 30
-
-                  echo -e "\n=== Checking cloudflared tunnel status ==="
-                  kubectl logs -n hello-world -l app=cloudflared --tail=100 || echo "No cloudflared logs"
-
-                  echo -e "\n=== Checking tunnel config in ConfigMap ==="
+                  echo "=== Checking tunnel config in ConfigMap ==="
                   kubectl get configmap hello-world-gateway-${{ steps.e2e-id.outputs.E2E_ID }}-tunnel-config -n hello-world -o yaml || echo "ConfigMap not found"
 
                   echo -e "\n=== Tunnel config content ==="
                   kubectl get configmap hello-world-gateway-${{ steps.e2e-id.outputs.E2E_ID }}-tunnel-config -n hello-world -o jsonpath='{.data.config\.yaml}' || echo "No config.yaml found"
+
+                  echo -e "\n=== Restarting cloudflared to pick up new route configuration ==="
+                  kubectl rollout restart deployment/hello-world-gateway-${{ steps.e2e-id.outputs.E2E_ID }}-cloudflared -n hello-world
+                  kubectl rollout status deployment/hello-world-gateway-${{ steps.e2e-id.outputs.E2E_ID }}-cloudflared -n hello-world --timeout=60s
+
+                  echo -e "\n=== Waiting 15 seconds for tunnel connections to establish ==="
+                  sleep 15
+
+                  echo -e "\n=== Checking cloudflared tunnel status after restart ==="
+                  kubectl logs -n hello-world -l app=cloudflared --tail=50 || echo "No cloudflared logs"
 
             - name: Verify resources are created
               run: |
@@ -310,16 +315,29 @@ jobs:
               run: |
                   echo "=== Testing service from within cluster ==="
                   kubectl run curl-test --image=curlimages/curl:latest --rm -i --restart=Never -n hello-world -- \
-                    curl -v http://hello-world.hello-world.svc.cluster.local:8080 --max-time 5 || echo "Internal service test failed"
+                      sh -c '
+                      RESPONSE_CODE=$(curl --location "http://hello-world.hello-world.svc.cluster.local:8080" \
+                      --write-out "\n%{http_code}" --silent --show-error)
+                      BODY=$(curl -vL --location "http://hello-world.hello-world.svc.cluster.local:8080" \
+                      --show-error)
+
+                      echo "Response Body:"
+                      echo "${BODY}"
+                      echo "Response Code:"
+                      echo "${RESPONSE_CODE}"
+
+                      if [[ "${RESPONSE_CODE}" != *"200" ]]; then
+                          echo "Expected HTTP 200 response but got different code."
+                          exit 1
+                      fi
+                      '
 
             - name: Test public access to application and ensure 200 response
               run: |
                   echo "=== Testing public HTTPS access ==="
                   RESPONSE_CODE=$(curl --location 'https://cfgc.george.dev' \
-                  --request GET \
                   --write-out '\n%{http_code}' --silent --show-error)
                   BODY=$(curl -vL --location 'https://cfgc.george.dev' \
-                  --request GET \
                   --show-error)
 
                   echo "Response Body:"
@@ -331,6 +349,8 @@ jobs:
                       echo "Expected HTTP 200 response but got different code."
                       exit 1
                   fi
+            - name: wait for 300 seconds
+              run: sleep 300
             - name: Export logs
               if: always()
               run: |
