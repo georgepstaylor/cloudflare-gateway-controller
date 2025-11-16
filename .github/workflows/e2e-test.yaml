@@ -315,13 +315,22 @@ jobs:
             - name: Test public access to application and ensure 200 response
               run: |
                   echo "=== Testing public HTTPS access ==="
-                    RESPONSE_CODE=$(curl -o /dev/null -s -w "%{http_code}\n" -H "Host: cfgc.george.dev" https://cloudflare-tunnel.george.dev/)
-                    echo "Response code: $RESPONSE_CODE"
-                    if [ "$RESPONSE_CODE" -ne 200 ]; then
-                      echo "Expected HTTP 200 but got $RESPONSE_CODE"
-                      exit 1
-                    fi
+                  RESPONSE_CODE=$(curl --location 'https://cfgc.george.dev' \
+                  --request GET \
+                  --write-out '\n%{http_code}' --silent --show-error)
+                  BODY=$(curl -vL --location 'https://cfgc.george.dev' \
+                  --request GET \
+                  --show-error)
 
+                  echo "Response Body:"
+                  echo "${BODY}"
+                  echo "Response Code:"
+                  echo "${RESPONSE_CODE}"
+
+                  if [[ "${RESPONSE_CODE}" != *"200" ]]; then
+                      echo "Expected HTTP 200 response but got different code."
+                      exit 1
+                  fi
             - name: Export logs
               if: always()
               run: |
@@ -350,7 +359,7 @@ jobs:
                   kubectl delete namespace hello-world || true
 
                   # uninstall helm chart
-                  helm uninstall cloudflare-gateway-controller -n cloudflare-gateway-system || true
+                  helm uninstall cloudflare-gateway-controller-${{ steps.e2e-id.outputs.E2E_ID }} -n cloudflare-gateway-system || true
 
             - name: Cleanup Cluster
               if: always()
