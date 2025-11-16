@@ -254,6 +254,17 @@ jobs:
                   timeout 60s bash -c 'until kubectl get httproute hello-world -n hello-world -o jsonpath="{.status.parents[0].conditions[?(@.type==\"Accepted\")].status}" | grep -q "True"; do sleep 2; done' || true
                   kubectl get httproute hello-world -n hello-world -o yaml
 
+            - name: Wait for tunnel configuration to update
+              run: |
+                  echo "Waiting 30 seconds for cloudflared to pick up route changes..."
+                  sleep 30
+
+                  echo -e "\n=== Checking cloudflared tunnel status ==="
+                  kubectl logs -n hello-world -l app=cloudflared --tail=100 || echo "No cloudflared logs"
+
+                  echo -e "\n=== Checking tunnel config in ConfigMap ==="
+                  kubectl get configmap -n hello-world -o yaml || true
+
             - name: Verify resources are created
               run: |
                   echo "=== GatewayClass ==="
@@ -301,8 +312,8 @@ jobs:
                   echo -e "\n=== DNS Resolution ==="
                   dig cfgc.george.dev || true
 
-            - name: Export logs on failure
-              if: failure()
+            - name: Export logs
+              if: always()
               run: |
                   echo "=== All pods ==="
                   kubectl get pods --all-namespaces
@@ -312,6 +323,9 @@ jobs:
 
                   echo -e "\n=== Controller logs ==="
                   kubectl logs -n cloudflare-gateway-system -l app.kubernetes.io/name=cloudflare-gateway-controller --tail=200 || true
+
+                  echo -e "\n=== Hello World namespace pods ==="
+                  kubectl get pods -n hello-world || true
 
                   echo -e "\n=== Gateway resources ==="
                   kubectl get gatewayclasses,gateways,httproutes --all-namespaces -o yaml || true
