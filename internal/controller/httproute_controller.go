@@ -11,6 +11,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -60,8 +61,22 @@ func (r *HTTPRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 
 	// Add finalizer if it doesn't exist
 	if !controllerutil.ContainsFinalizer(route, httprouteFinalizer) {
-		controllerutil.AddFinalizer(route, httprouteFinalizer)
-		if err := r.Update(ctx, route); err != nil {
+		if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+			// Fetch the latest version of the HTTPRoute
+			latestRoute := &gatewayv1.HTTPRoute{}
+			if err := r.Get(ctx, req.NamespacedName, latestRoute); err != nil {
+				return err
+			}
+			if !controllerutil.ContainsFinalizer(latestRoute, httprouteFinalizer) {
+				controllerutil.AddFinalizer(latestRoute, httprouteFinalizer)
+				return r.Update(ctx, latestRoute)
+			}
+			return nil
+		}); err != nil {
+			return ctrl.Result{}, err
+		}
+		// Re-fetch the route after update
+		if err := r.Get(ctx, req.NamespacedName, route); err != nil {
 			return ctrl.Result{}, err
 		}
 	}
@@ -140,16 +155,25 @@ func (r *HTTPRouteReconciler) reconcileParentGateway(ctx context.Context, route 
 		// Don't fail the reconciliation if DNS fails - it's not critical
 	}
 
-	// Update HTTPRoute status
-	r.setRouteCondition(route, parentIndex, gatewayv1.RouteConditionAccepted, metav1.ConditionTrue,
-		gatewayv1.RouteReasonAccepted, "Route accepted")
-	r.setRouteCondition(route, parentIndex, gatewayv1.RouteConditionResolvedRefs, metav1.ConditionTrue,
-		gatewayv1.RouteReasonResolvedRefs, "All references resolved")
+	// Update HTTPRoute status with retry
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		// Fetch the latest version of the HTTPRoute
+		latestRoute := &gatewayv1.HTTPRoute{}
+		if err := r.Get(ctx, types.NamespacedName{
+			Name:      route.Name,
+			Namespace: route.Namespace,
+		}, latestRoute); err != nil {
+			return err
+		}
 
-	// Note: Gateway controller will update its ConfigMap when it reconciles
-	// due to the watch on HTTPRoute changes
+		// Re-apply status conditions
+		r.setRouteCondition(latestRoute, parentIndex, gatewayv1.RouteConditionAccepted, metav1.ConditionTrue,
+			gatewayv1.RouteReasonAccepted, "Route accepted")
+		r.setRouteCondition(latestRoute, parentIndex, gatewayv1.RouteConditionResolvedRefs, metav1.ConditionTrue,
+			gatewayv1.RouteReasonResolvedRefs, "All references resolved")
 
-	return r.Status().Update(ctx, route)
+		return r.Status().Update(ctx, latestRoute)
+	})
 }
 
 func (r *HTTPRouteReconciler) buildIngressRules(ctx context.Context, route *gatewayv1.HTTPRoute) ([]cloudflare.IngressRule, error) {
@@ -317,13 +341,22 @@ func (r *HTTPRouteReconciler) handleDeletion(ctx context.Context, route *gateway
 
 	logger.Info("cleaning up httproute", "name", route.Name)
 
-	// Remove finalizer
-	controllerutil.RemoveFinalizer(route, httprouteFinalizer)
-	if err := r.Update(ctx, route); err != nil {
-		return ctrl.Result{}, err
-	}
-
-	return ctrl.Result{}, nil
+	// Remove finalizer with retry
+	return ctrl.Result{}, retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		// Fetch the latest version of the HTTPRoute
+		latestRoute := &gatewayv1.HTTPRoute{}
+		if err := r.Get(ctx, types.NamespacedName{
+			Name:      route.Name,
+			Namespace: route.Namespace,
+		}, latestRoute); err != nil {
+			return err
+		}
+		if controllerutil.ContainsFinalizer(latestRoute, httprouteFinalizer) {
+			controllerutil.RemoveFinalizer(latestRoute, httprouteFinalizer)
+			return r.Update(ctx, latestRoute)
+		}
+		return nil
+	})
 }
 
 func (r *HTTPRouteReconciler) getCloudflareClient(ctx context.Context, gatewayClass *gatewayv1.GatewayClass) (*cloudflare.Client, error) {

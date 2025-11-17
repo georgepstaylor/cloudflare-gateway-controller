@@ -12,6 +12,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -62,8 +63,22 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 	// Add finalizer if it doesn't exist
 	if !controllerutil.ContainsFinalizer(gateway, gatewayFinalizer) {
-		controllerutil.AddFinalizer(gateway, gatewayFinalizer)
-		if err := r.Update(ctx, gateway); err != nil {
+		if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+			// Fetch the latest version of the Gateway
+			latestGateway := &gatewayv1.Gateway{}
+			if err := r.Get(ctx, req.NamespacedName, latestGateway); err != nil {
+				return err
+			}
+			if !controllerutil.ContainsFinalizer(latestGateway, gatewayFinalizer) {
+				controllerutil.AddFinalizer(latestGateway, gatewayFinalizer)
+				return r.Update(ctx, latestGateway)
+			}
+			return nil
+		}); err != nil {
+			return ctrl.Result{}, err
+		}
+		// Re-fetch the gateway after update
+		if err := r.Get(ctx, req.NamespacedName, gateway); err != nil {
 			return ctrl.Result{}, err
 		}
 	}
@@ -132,19 +147,33 @@ func (r *GatewayReconciler) reconcileGateway(ctx context.Context, gateway *gatew
 		tunnelID = tunnel.ID
 		logger.Info("created cloudflare tunnel", "tunnelID", tunnelID, "name", tunnelName)
 
-		// Store tunnel information in annotations
-		if gateway.Annotations == nil {
-			gateway.Annotations = make(map[string]string)
-		}
-		gateway.Annotations["george.dev/tunnel-id"] = tunnelID
-		gateway.Annotations["george.dev/tunnel-secret"] = secret
-		gateway.Annotations["george.dev/tunnel-name"] = tunnel.Name
-		gateway.Annotations["george.dev/account-id"] = cfClient.AccountID()
+		// Store tunnel information in annotations with retry
+		if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+			// Fetch the latest version of the Gateway
+			latestGateway := &gatewayv1.Gateway{}
+			if err := r.Get(ctx, types.NamespacedName{Name: gateway.Name, Namespace: gateway.Namespace}, latestGateway); err != nil {
+				return err
+			}
 
-		if err := r.Update(ctx, gateway); err != nil {
+			// Update annotations on the latest version
+			if latestGateway.Annotations == nil {
+				latestGateway.Annotations = make(map[string]string)
+			}
+			latestGateway.Annotations["george.dev/tunnel-id"] = tunnelID
+			latestGateway.Annotations["george.dev/tunnel-secret"] = secret
+			latestGateway.Annotations["george.dev/tunnel-name"] = tunnel.Name
+			latestGateway.Annotations["george.dev/account-id"] = cfClient.AccountID()
+
+			return r.Update(ctx, latestGateway)
+		}); err != nil {
 			// Try to clean up the tunnel if we can't update the gateway
 			_ = cfClient.DeleteTunnel(ctx, tunnelID)
 			return fmt.Errorf("failed to update gateway with tunnel info: %w", err)
+		}
+
+		// Re-fetch the gateway after update
+		if err := r.Get(ctx, types.NamespacedName{Name: gateway.Name, Namespace: gateway.Namespace}, gateway); err != nil {
+			return fmt.Errorf("failed to re-fetch gateway: %w", err)
 		}
 	}
 
@@ -169,30 +198,38 @@ func (r *GatewayReconciler) reconcileGateway(ctx context.Context, gateway *gatew
 		// Don't fail reconciliation - config will be updated when routes change
 	}
 
-	// Update Gateway status
-	r.setGatewayCondition(gateway, gatewayv1.GatewayConditionAccepted, metav1.ConditionTrue,
-		gatewayv1.GatewayReasonAccepted, "Gateway accepted")
-	r.setGatewayCondition(gateway, gatewayv1.GatewayConditionProgrammed, metav1.ConditionTrue,
-		gatewayv1.GatewayReasonProgrammed, "Gateway programmed")
-
-	// Update listener status with actual attached route counts
-	if err := r.updateListenerStatus(ctx, gateway); err != nil {
-		logger.Error(err, "failed to update listener status")
-		// Don't fail reconciliation
-	}
-
-	// Set the tunnel hostname as the gateway address
+	// Set the tunnel hostname as the gateway address with retry
 	tunnelID = gateway.Annotations["george.dev/tunnel-id"]
 	tunnelHostname := fmt.Sprintf("%s.cfargotunnel.com", tunnelID)
 
-	gateway.Status.Addresses = []gatewayv1.GatewayStatusAddress{
-		{
-			Type:  ptrTo(gatewayv1.HostnameAddressType),
-			Value: tunnelHostname,
-		},
-	}
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		// Fetch the latest version of the Gateway for status update
+		latestGateway := &gatewayv1.Gateway{}
+		if err := r.Get(ctx, types.NamespacedName{Name: gateway.Name, Namespace: gateway.Namespace}, latestGateway); err != nil {
+			return err
+		}
 
-	return r.Status().Update(ctx, gateway)
+		// Update status fields
+		r.setGatewayCondition(latestGateway, gatewayv1.GatewayConditionAccepted, metav1.ConditionTrue,
+			gatewayv1.GatewayReasonAccepted, "Gateway accepted")
+		r.setGatewayCondition(latestGateway, gatewayv1.GatewayConditionProgrammed, metav1.ConditionTrue,
+			gatewayv1.GatewayReasonProgrammed, "Gateway programmed")
+
+		// Update listener status
+		if err := r.updateListenerStatus(ctx, latestGateway); err != nil {
+			logger.Error(err, "failed to update listener status")
+			// Don't fail on listener status errors
+		}
+
+		latestGateway.Status.Addresses = []gatewayv1.GatewayStatusAddress{
+			{
+				Type:  ptrTo(gatewayv1.HostnameAddressType),
+				Value: tunnelHostname,
+			},
+		}
+
+		return r.Status().Update(ctx, latestGateway)
+	})
 }
 
 // updateListenerStatus counts attached routes per listener and updates status
@@ -597,8 +634,18 @@ func (r *GatewayReconciler) updateGatewayConfigFromRoutes(ctx context.Context, g
 		return fmt.Errorf("failed to get configmap: %w", err)
 	}
 
-	configMap.Data["config.yaml"] = config
-	if err := r.Update(ctx, configMap); err != nil {
+	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		// Fetch the latest version of the ConfigMap
+		latestConfigMap := &corev1.ConfigMap{}
+		if err := r.Get(ctx, types.NamespacedName{
+			Name:      configMapName,
+			Namespace: gateway.Namespace,
+		}, latestConfigMap); err != nil {
+			return err
+		}
+		latestConfigMap.Data["config.yaml"] = config
+		return r.Update(ctx, latestConfigMap)
+	}); err != nil {
 		return fmt.Errorf("failed to update configmap: %w", err)
 	}
 
@@ -731,7 +778,27 @@ func (r *GatewayReconciler) updateConflictedRouteStatus(ctx context.Context, rou
 
 	meta.SetStatusCondition(&latestRoute.Status.Parents[0].Conditions, condition)
 
-	if err := r.Status().Update(ctx, latestRoute); err != nil {
+	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		// Re-fetch to get the latest version
+		currentRoute := &gatewayv1.HTTPRoute{}
+		if err := r.Get(ctx, types.NamespacedName{
+			Name:      route.Name,
+			Namespace: route.Namespace,
+		}, currentRoute); err != nil {
+			return err
+		}
+
+		// Re-apply the status update
+		if len(currentRoute.Status.Parents) == 0 {
+			currentRoute.Status.Parents = make([]gatewayv1.RouteParentStatus, 1)
+			currentRoute.Status.Parents[0] = gatewayv1.RouteParentStatus{
+				ParentRef:      latestRoute.Spec.ParentRefs[0],
+				ControllerName: controllerName,
+			}
+		}
+		meta.SetStatusCondition(&currentRoute.Status.Parents[0].Conditions, condition)
+		return r.Status().Update(ctx, currentRoute)
+	}); err != nil {
 		logger.Error(err, "failed to update conflicted route status", "route", route.Name)
 	}
 }
@@ -824,9 +891,19 @@ func (r *GatewayReconciler) handleDeletion(ctx context.Context, gateway *gateway
 		}
 	}
 
-	// Remove finalizer
-	controllerutil.RemoveFinalizer(gateway, gatewayFinalizer)
-	if err := r.Update(ctx, gateway); err != nil {
+	// Remove finalizer with retry
+	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		// Fetch the latest version of the Gateway
+		latestGateway := &gatewayv1.Gateway{}
+		if err := r.Get(ctx, types.NamespacedName{Name: gateway.Name, Namespace: gateway.Namespace}, latestGateway); err != nil {
+			return err
+		}
+		if controllerutil.ContainsFinalizer(latestGateway, gatewayFinalizer) {
+			controllerutil.RemoveFinalizer(latestGateway, gatewayFinalizer)
+			return r.Update(ctx, latestGateway)
+		}
+		return nil
+	}); err != nil {
 		return ctrl.Result{}, err
 	}
 

@@ -10,6 +10,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -63,15 +64,19 @@ func (r *GatewayClassReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return ctrl.Result{}, fmt.Errorf("parametersRef is required")
 	}
 
-	// Mark as accepted
-	r.setGatewayClassCondition(gatewayClass, metav1.ConditionTrue,
-		gatewayv1.GatewayClassReasonAccepted, "GatewayClass accepted")
+	// Mark as accepted and update status with retry
+	return ctrl.Result{}, retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		// Fetch the latest version of the GatewayClass
+		latestGatewayClass := &gatewayv1.GatewayClass{}
+		if err := r.Get(ctx, req.NamespacedName, latestGatewayClass); err != nil {
+			return err
+		}
 
-	if err := r.Status().Update(ctx, gatewayClass); err != nil {
-		return ctrl.Result{}, err
-	}
+		r.setGatewayClassCondition(latestGatewayClass, metav1.ConditionTrue,
+			gatewayv1.GatewayClassReasonAccepted, "GatewayClass accepted")
 
-	return ctrl.Result{}, nil
+		return r.Status().Update(ctx, latestGatewayClass)
+	})
 }
 
 func (r *GatewayClassReconciler) validateParametersRef(ctx context.Context, gatewayClass *gatewayv1.GatewayClass) error {
