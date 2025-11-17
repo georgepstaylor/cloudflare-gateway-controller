@@ -48,7 +48,7 @@ func (c *Client) CreateTunnel(ctx context.Context, name string) (*cloudflare.Tun
 	params := cloudflare.TunnelCreateParams{
 		Name:      name,
 		Secret:    secret,
-		ConfigSrc: "cloudflare",
+		ConfigSrc: "local",
 	}
 
 	tunnel, err := c.api.CreateTunnel(ctx, cloudflare.AccountIdentifier(c.accountID), params)
