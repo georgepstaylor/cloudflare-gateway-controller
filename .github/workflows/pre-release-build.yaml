@@ -1,0 +1,19 @@
+name: Pre-Release Build
+
+on:
+    push:
+        branches:
+            - main
+jobs:
+    build-image:
+        name: Build Controller Image
+        uses: ./.github/workflows/build-image-reusable.yaml
+        permissions:
+            contents: read
+            packages: write
+        with:
+            push: true
+            platforms: linux/amd64
+            tags: |
+                type=ref,event=branch
+                type=sha
