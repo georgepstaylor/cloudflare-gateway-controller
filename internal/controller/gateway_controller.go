@@ -133,52 +133,43 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 func (r *GatewayReconciler) reconcileGateway(ctx context.Context, gateway *gatewayv1.Gateway, cfClient *cloudflare.Client) error {
 	logger := log.FromContext(ctx)
 
-	// Check if tunnel already exists (stored in annotation)
-	tunnelID := gateway.Annotations["george.dev/tunnel-id"]
+	// Check if tunnel already exists by checking if Secret exists
+	secretName := fmt.Sprintf("%s-tunnel-credentials", gateway.Name)
+	existingSecret := &corev1.Secret{}
+	secretExists := true
+	if err := r.Get(ctx, types.NamespacedName{Name: secretName, Namespace: gateway.Namespace}, existingSecret); err != nil {
+		if !apierrors.IsNotFound(err) {
+			return fmt.Errorf("failed to check for existing tunnel secret: %w", err)
+		}
+		secretExists = false
+	}
 
-	if tunnelID == "" {
+	// Create tunnel if it doesn't exist
+	var tunnelID, tunnelSecret, tunnelName, accountID string
+	if !secretExists {
 		// Create new tunnel
-		tunnelName := fmt.Sprintf("%s-%s", gateway.Namespace, gateway.Name)
-		tunnel, secret, err := cfClient.CreateTunnel(ctx, tunnelName)
+		name := fmt.Sprintf("%s-%s", gateway.Namespace, gateway.Name)
+		tunnel, secret, err := cfClient.CreateTunnel(ctx, name)
 		if err != nil {
 			return fmt.Errorf("failed to create tunnel: %w", err)
 		}
 
 		tunnelID = tunnel.ID
+		tunnelSecret = secret
+		tunnelName = tunnel.Name
+		accountID = cfClient.AccountID()
+
 		logger.Info("created cloudflare tunnel", "tunnelID", tunnelID, "name", tunnelName)
-
-		// Store tunnel information in annotations with retry
-		if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-			// Fetch the latest version of the Gateway
-			latestGateway := &gatewayv1.Gateway{}
-			if err := r.Get(ctx, types.NamespacedName{Name: gateway.Name, Namespace: gateway.Namespace}, latestGateway); err != nil {
-				return err
-			}
-
-			// Update annotations on the latest version
-			if latestGateway.Annotations == nil {
-				latestGateway.Annotations = make(map[string]string)
-			}
-			latestGateway.Annotations["george.dev/tunnel-id"] = tunnelID
-			latestGateway.Annotations["george.dev/tunnel-secret"] = secret
-			latestGateway.Annotations["george.dev/tunnel-name"] = tunnel.Name
-			latestGateway.Annotations["george.dev/account-id"] = cfClient.AccountID()
-
-			return r.Update(ctx, latestGateway)
-		}); err != nil {
-			// Try to clean up the tunnel if we can't update the gateway
-			_ = cfClient.DeleteTunnel(ctx, tunnelID)
-			return fmt.Errorf("failed to update gateway with tunnel info: %w", err)
-		}
-
-		// Re-fetch the gateway after update
-		if err := r.Get(ctx, types.NamespacedName{Name: gateway.Name, Namespace: gateway.Namespace}, gateway); err != nil {
-			return fmt.Errorf("failed to re-fetch gateway: %w", err)
-		}
+	} else {
+		// Read existing tunnel info from Secret
+		tunnelID = string(existingSecret.Data["tunnel-id"])
+		tunnelSecret = string(existingSecret.Data["tunnel-secret"])
+		tunnelName = string(existingSecret.Data["tunnel-name"])
+		accountID = string(existingSecret.Data["account-id"])
 	}
 
 	// Create or update credentials Secret
-	if err := r.reconcileCredentialsSecret(ctx, gateway, cfClient); err != nil {
+	if err := r.reconcileCredentialsSecret(ctx, gateway, tunnelID, tunnelSecret, tunnelName, accountID); err != nil {
 		return fmt.Errorf("failed to reconcile credentials secret: %w", err)
 	}
 
@@ -198,8 +189,7 @@ func (r *GatewayReconciler) reconcileGateway(ctx context.Context, gateway *gatew
 		// Don't fail reconciliation - config will be updated when routes change
 	}
 
-	// Set the tunnel hostname as the gateway address with retry
-	tunnelID = gateway.Annotations["george.dev/tunnel-id"]
+	// Set the tunnel hostname for status update
 	tunnelHostname := fmt.Sprintf("%s.cfargotunnel.com", tunnelID)
 
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
@@ -324,153 +314,176 @@ func (r *GatewayReconciler) routeMatchesListener(route *gatewayv1.HTTPRoute, gat
 	return false
 }
 
-func (r *GatewayReconciler) reconcileCredentialsSecret(ctx context.Context, gateway *gatewayv1.Gateway, cfClient *cloudflare.Client) error {
+func (r *GatewayReconciler) reconcileCredentialsSecret(ctx context.Context, gateway *gatewayv1.Gateway, tunnelID, tunnelSecret, tunnelName, accountID string) error {
 	secretName := fmt.Sprintf("%s-tunnel-credentials", gateway.Name)
-	secret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      secretName,
-			Namespace: gateway.Namespace,
-		},
-	}
 
-	_, err := controllerutil.CreateOrUpdate(ctx, r.Client, secret, func() error {
-		if secret.Data == nil {
-			secret.Data = make(map[string][]byte)
+	// Use retry logic to handle concurrent modifications
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		secret := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      secretName,
+				Namespace: gateway.Namespace,
+			},
 		}
 
-		// Generate credentials JSON
-		tunnelID := gateway.Annotations["george.dev/tunnel-id"]
-		tunnelSecret := gateway.Annotations["george.dev/tunnel-secret"]
-		accountID := gateway.Annotations["george.dev/account-id"]
+		_, err := controllerutil.CreateOrUpdate(ctx, r.Client, secret, func() error {
+			if secret.Data == nil {
+				secret.Data = make(map[string][]byte)
+			}
 
-		generator := cloudflare.NewConfigGenerator()
-		credentialsJSON := generator.GenerateCredentialsJSON(accountID, tunnelID, tunnelSecret)
+			// Store all tunnel metadata in Secret
+			secret.Data["tunnel-id"] = []byte(tunnelID)
+			secret.Data["tunnel-secret"] = []byte(tunnelSecret)
+			secret.Data["account-id"] = []byte(accountID)
+			secret.Data["tunnel-name"] = []byte(tunnelName)
 
-		secret.Data["credentials.json"] = []byte(credentialsJSON)
-		secret.Type = corev1.SecretTypeOpaque
+			// Generate credentials JSON
+			generator := cloudflare.NewConfigGenerator()
+			credentialsJSON := generator.GenerateCredentialsJSON(accountID, tunnelID, tunnelSecret)
+			secret.Data["credentials.json"] = []byte(credentialsJSON)
+			secret.Type = corev1.SecretTypeOpaque
 
-		return controllerutil.SetControllerReference(gateway, secret, r.Scheme)
+			return controllerutil.SetControllerReference(gateway, secret, r.Scheme)
+		})
+
+		return err
 	})
-
-	return err
 }
 
 func (r *GatewayReconciler) reconcileConfigMap(ctx context.Context, gateway *gatewayv1.Gateway) error {
 	configMapName := fmt.Sprintf("%s-tunnel-config", gateway.Name)
-	configMap := &corev1.ConfigMap{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      configMapName,
-			Namespace: gateway.Namespace,
-		},
-	}
 
-	_, err := controllerutil.CreateOrUpdate(ctx, r.Client, configMap, func() error {
-		if configMap.Data == nil {
-			configMap.Data = make(map[string]string)
+	// Use retry logic to handle concurrent modifications
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		configMap := &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      configMapName,
+				Namespace: gateway.Namespace,
+			},
 		}
 
-		// Only initialize config if it doesn't exist yet
-		// HTTPRoute controller will update it with actual routes
-		if _, exists := configMap.Data["config.yaml"]; !exists {
-			// Generate initial config with just a 404 catch-all
-			tunnelID := gateway.Annotations["george.dev/tunnel-id"]
-			generator := cloudflare.NewConfigGenerator()
-			config, err := generator.GenerateConfig(tunnelID, []cloudflare.IngressRule{})
-			if err != nil {
-				return err
+		_, err := controllerutil.CreateOrUpdate(ctx, r.Client, configMap, func() error {
+			if configMap.Data == nil {
+				configMap.Data = make(map[string]string)
 			}
 
-			configMap.Data["config.yaml"] = config
-		}
+			// Only initialize config if it doesn't exist yet
+			// HTTPRoute controller will update it with actual routes
+			if _, exists := configMap.Data["config.yaml"]; !exists {
+				// Get tunnel ID from Secret
+				secretName := fmt.Sprintf("%s-tunnel-credentials", gateway.Name)
+				tunnelSecret := &corev1.Secret{}
+				if err := r.Get(ctx, types.NamespacedName{Name: secretName, Namespace: gateway.Namespace}, tunnelSecret); err != nil {
+					return fmt.Errorf("failed to get tunnel secret: %w", err)
+				}
+				tunnelID := string(tunnelSecret.Data["tunnel-id"])
+				if tunnelID == "" {
+					return fmt.Errorf("tunnel-id not found in secret")
+				}
 
-		return controllerutil.SetControllerReference(gateway, configMap, r.Scheme)
+				// Generate initial config with just a 404 catch-all
+				generator := cloudflare.NewConfigGenerator()
+				config, err := generator.GenerateConfig(tunnelID, []cloudflare.IngressRule{})
+				if err != nil {
+					return err
+				}
+
+				configMap.Data["config.yaml"] = config
+			}
+
+			return controllerutil.SetControllerReference(gateway, configMap, r.Scheme)
+		})
+
+		return err
 	})
-
-	return err
 }
 
 func (r *GatewayReconciler) reconcileDeployment(ctx context.Context, gateway *gatewayv1.Gateway) error {
 	deploymentName := fmt.Sprintf("%s-cloudflared", gateway.Name)
-	deployment := &appsv1.Deployment{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      deploymentName,
-			Namespace: gateway.Namespace,
-		},
-	}
 
-	_, err := controllerutil.CreateOrUpdate(ctx, r.Client, deployment, func() error {
-		replicas := int32(2)
-		deployment.Spec = appsv1.DeploymentSpec{
-			Replicas: &replicas,
-			Selector: &metav1.LabelSelector{
-				MatchLabels: map[string]string{
-					"app":     "cloudflared",
-					"gateway": gateway.Name,
-				},
+	// Use retry logic to handle concurrent modifications
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		deployment := &appsv1.Deployment{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      deploymentName,
+				Namespace: gateway.Namespace,
 			},
-			Template: corev1.PodTemplateSpec{
-				ObjectMeta: metav1.ObjectMeta{
-					Labels: map[string]string{
+		}
+
+		_, err := controllerutil.CreateOrUpdate(ctx, r.Client, deployment, func() error {
+			replicas := int32(2)
+			deployment.Spec = appsv1.DeploymentSpec{
+				Replicas: &replicas,
+				Selector: &metav1.LabelSelector{
+					MatchLabels: map[string]string{
 						"app":     "cloudflared",
 						"gateway": gateway.Name,
 					},
 				},
-				Spec: corev1.PodSpec{
-					Containers: []corev1.Container{
-						{
-							Name:  "cloudflared",
-							Image: "cloudflare/cloudflared:latest",
-							Args: []string{
-								"tunnel",
-								"--config",
-								"/etc/cloudflared/config.yaml",
-								"--no-autoupdate",
-								"run",
-							},
-							VolumeMounts: []corev1.VolumeMount{
-								{
-									Name:      "config",
-									MountPath: "/etc/cloudflared/config.yaml",
-									SubPath:   "config.yaml",
-									ReadOnly:  true,
-								},
-								{
-									Name:      "credentials",
-									MountPath: "/etc/cloudflared/credentials.json",
-									SubPath:   "credentials.json",
-									ReadOnly:  true,
-								},
-							},
+				Template: corev1.PodTemplateSpec{
+					ObjectMeta: metav1.ObjectMeta{
+						Labels: map[string]string{
+							"app":     "cloudflared",
+							"gateway": gateway.Name,
 						},
 					},
-					Volumes: []corev1.Volume{
-						{
-							Name: "config",
-							VolumeSource: corev1.VolumeSource{
-								ConfigMap: &corev1.ConfigMapVolumeSource{
-									LocalObjectReference: corev1.LocalObjectReference{
-										Name: fmt.Sprintf("%s-tunnel-config", gateway.Name),
+					Spec: corev1.PodSpec{
+						Containers: []corev1.Container{
+							{
+								Name:  "cloudflared",
+								Image: "cloudflare/cloudflared:latest",
+								Args: []string{
+									"tunnel",
+									"--config",
+									"/etc/cloudflared/config.yaml",
+									"--no-autoupdate",
+									"run",
+								},
+								VolumeMounts: []corev1.VolumeMount{
+									{
+										Name:      "config",
+										MountPath: "/etc/cloudflared/config.yaml",
+										SubPath:   "config.yaml",
+										ReadOnly:  true,
+									},
+									{
+										Name:      "credentials",
+										MountPath: "/etc/cloudflared/credentials.json",
+										SubPath:   "credentials.json",
+										ReadOnly:  true,
 									},
 								},
 							},
 						},
-						{
-							Name: "credentials",
-							VolumeSource: corev1.VolumeSource{
-								Secret: &corev1.SecretVolumeSource{
-									SecretName: fmt.Sprintf("%s-tunnel-credentials", gateway.Name),
+						Volumes: []corev1.Volume{
+							{
+								Name: "config",
+								VolumeSource: corev1.VolumeSource{
+									ConfigMap: &corev1.ConfigMapVolumeSource{
+										LocalObjectReference: corev1.LocalObjectReference{
+											Name: fmt.Sprintf("%s-tunnel-config", gateway.Name),
+										},
+									},
+								},
+							},
+							{
+								Name: "credentials",
+								VolumeSource: corev1.VolumeSource{
+									Secret: &corev1.SecretVolumeSource{
+										SecretName: fmt.Sprintf("%s-tunnel-credentials", gateway.Name),
+									},
 								},
 							},
 						},
 					},
 				},
-			},
-		}
+			}
 
-		return controllerutil.SetControllerReference(gateway, deployment, r.Scheme)
+			return controllerutil.SetControllerReference(gateway, deployment, r.Scheme)
+		})
+
+		return err
 	})
-
-	return err
 }
 
 // getAllHTTPRoutesForGateway lists all HTTPRoutes that reference this Gateway
@@ -611,10 +624,15 @@ func (r *GatewayReconciler) updateGatewayConfigFromRoutes(ctx context.Context, g
 		}
 	}
 
-	// Get tunnel ID from Gateway annotations
-	tunnelID := gateway.Annotations["george.dev/tunnel-id"]
+	// Get tunnel ID from Secret
+	secretName := fmt.Sprintf("%s-tunnel-credentials", gateway.Name)
+	tunnelSecret := &corev1.Secret{}
+	if err := r.Get(ctx, types.NamespacedName{Name: secretName, Namespace: gateway.Namespace}, tunnelSecret); err != nil {
+		return fmt.Errorf("failed to get tunnel secret: %w", err)
+	}
+	tunnelID := string(tunnelSecret.Data["tunnel-id"])
 	if tunnelID == "" {
-		return fmt.Errorf("gateway has no tunnel-id annotation")
+		return fmt.Errorf("tunnel-id not found in secret")
 	}
 
 	// Generate new config
@@ -873,19 +891,23 @@ func (r *GatewayReconciler) handleDeletion(ctx context.Context, gateway *gateway
 		return ctrl.Result{}, nil
 	}
 
-	// Get tunnel ID from annotations
-	tunnelID := gateway.Annotations["george.dev/tunnel-id"]
-	if tunnelID != "" {
-		// Get Cloudflare client
-		gatewayClass := &gatewayv1.GatewayClass{}
-		if err := r.Get(ctx, types.NamespacedName{Name: string(gateway.Spec.GatewayClassName)}, gatewayClass); err == nil {
-			if cfClient, err := r.getCloudflareClient(ctx, gatewayClass); err == nil {
-				// Delete the tunnel
-				if err := cfClient.DeleteTunnel(ctx, tunnelID); err != nil {
-					logger.Error(err, "failed to delete cloudflare tunnel", "tunnelID", tunnelID)
-					// Continue with finalizer removal even if tunnel deletion fails
-				} else {
-					logger.Info("deleted cloudflare tunnel", "tunnelID", tunnelID)
+	// Get tunnel ID from Secret
+	secretName := fmt.Sprintf("%s-tunnel-credentials", gateway.Name)
+	tunnelSecret := &corev1.Secret{}
+	if err := r.Get(ctx, types.NamespacedName{Name: secretName, Namespace: gateway.Namespace}, tunnelSecret); err == nil {
+		tunnelID := string(tunnelSecret.Data["tunnel-id"])
+		if tunnelID != "" {
+			// Get Cloudflare client
+			gatewayClass := &gatewayv1.GatewayClass{}
+			if err := r.Get(ctx, types.NamespacedName{Name: string(gateway.Spec.GatewayClassName)}, gatewayClass); err == nil {
+				if cfClient, err := r.getCloudflareClient(ctx, gatewayClass); err == nil {
+					// Delete the tunnel
+					if err := cfClient.DeleteTunnel(ctx, tunnelID); err != nil {
+						logger.Error(err, "failed to delete cloudflare tunnel", "tunnelID", tunnelID)
+						// Continue with finalizer removal even if tunnel deletion fails
+					} else {
+						logger.Info("deleted cloudflare tunnel", "tunnelID", tunnelID)
+					}
 				}
 			}
 		}
