@@ -683,10 +683,10 @@ func (r *GatewayReconciler) updateGatewayConfigFromRoutes(ctx context.Context, g
 // This triggers an automatic rollout when the config changes
 func (r *GatewayReconciler) updateDeploymentConfigHash(ctx context.Context, gateway *gatewayv1.Gateway, config string) error {
 	deploymentName := fmt.Sprintf("%s-cloudflared", gateway.Name)
-	
+
 	// Calculate hash of the config
 	configHash := fmt.Sprintf("%x", md5.Sum([]byte(config)))[:10]
-	
+
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		deployment := &appsv1.Deployment{}
 		if err := r.Get(ctx, types.NamespacedName{
@@ -695,13 +695,13 @@ func (r *GatewayReconciler) updateDeploymentConfigHash(ctx context.Context, gate
 		}, deployment); err != nil {
 			return err
 		}
-		
+
 		// Update the pod template annotation to trigger a rollout
 		if deployment.Spec.Template.Annotations == nil {
 			deployment.Spec.Template.Annotations = make(map[string]string)
 		}
 		deployment.Spec.Template.Annotations["cloudflare-gateway-controller/config-hash"] = configHash
-		
+
 		return r.Update(ctx, deployment)
 	})
 }

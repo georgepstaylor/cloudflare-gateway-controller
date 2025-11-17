@@ -107,6 +107,7 @@ func (c *Client) CreateDNSRecord(ctx context.Context, params DNSRecordParams) (*
 		Content: params.Content,
 		Proxied: &params.Proxied,
 		TTL:     params.TTL,
+		Comment: stringPtr("Created by Cloudflare Gateway Controller (github.com/georgepstaylor/cloudflare-gateway-controller)"),
 	}
 
 	response, err := c.api.CreateDNSRecord(ctx, cloudflare.ZoneIdentifier(params.ZoneID), record)
@@ -126,6 +127,7 @@ func (c *Client) UpdateDNSRecord(ctx context.Context, zoneID, recordID string, p
 		Content: params.Content,
 		Proxied: &params.Proxied,
 		TTL:     params.TTL,
+		Comment: stringPtr("Updated by Cloudflare Gateway Controller (github.com/georgepstaylor/cloudflare-gateway-controller)"),
 	}
 
 	_, err := c.api.UpdateDNSRecord(ctx, cloudflare.ZoneIdentifier(zoneID), record)
@@ -178,4 +180,9 @@ func generateTunnelSecret() (string, error) {
 	secret := make([]byte, 32)
 	// TODO: Use crypto/rand to generate secure random bytes
 	return fmt.Sprintf("%x", secret), nil
+}
+
+// stringPtr returns a pointer to the given string
+func stringPtr(s string) *string {
+	return &s
 }
