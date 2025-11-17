@@ -169,7 +169,7 @@ jobs:
           kind: Gateway
           metadata:
             name: hello-world-gateway-${{ steps.e2e-id.outputs.E2E_ID }}
-            namespace: hello-world
+            namespace: cloudflare-gateway-system
           spec:
             gatewayClassName: cloudflare-${{ steps.e2e-id.outputs.E2E_ID }}
             listeners:
