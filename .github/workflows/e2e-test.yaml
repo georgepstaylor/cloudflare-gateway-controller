@@ -28,7 +28,6 @@ jobs:
         uses: dorny/paths-filter@v3
         id: filter
         with:
-          base: ${{ github.event.before }}
           filters: |
             code:
               - 'cmd/**'
@@ -291,7 +290,7 @@ jobs:
               - name: hello-world-gateway-${{ steps.e2e-id.outputs.E2E_ID }}
                 namespace: cloudflare-gateway-system
             hostnames:
-              - "cfgc.george.dev"
+              - "testhw.george.dev"
             rules:
               - matches:
                   - path:
@@ -382,9 +381,9 @@ jobs:
       - name: Test public access to application and ensure 200 response
         run: |
           echo "=== Testing public HTTPS access ==="
-          RESPONSE_CODE=$(curl --location 'https://cfgc.george.dev' \
+          RESPONSE_CODE=$(curl --location 'https://testhw.george.dev' \
           --write-out '\n%{http_code}' --silent --show-error)
-          BODY=$(curl -vL --location 'https://cfgc.george.dev' \
+          BODY=$(curl -vL --location 'https://testhw.george.dev' \
           --show-error)
 
           echo "Response Body:"
