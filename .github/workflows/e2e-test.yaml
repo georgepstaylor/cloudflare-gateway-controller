@@ -290,7 +290,7 @@ jobs:
               - name: hello-world-gateway-${{ steps.e2e-id.outputs.E2E_ID }}
                 namespace: cloudflare-gateway-system
             hostnames:
-              - "testhw.george.dev"
+              - "cfgwc.george.dev"
             rules:
               - matches:
                   - path:
@@ -306,130 +306,53 @@ jobs:
           timeout 60s bash -c 'until kubectl get httproute hello-world-${{ steps.e2e-id.outputs.E2E_ID }} -n hello-world -o jsonpath="{.status.parents[0].conditions[?(@.type==\"Accepted\")].status}" | grep -q "True"; do sleep 2; done' || true
           kubectl get httproute hello-world-${{ steps.e2e-id.outputs.E2E_ID }} -n hello-world -o yaml
 
-      - name: Wait for cloudflared to pick up route changes
+      - name: Wait for route to be configured in tunnel
         run: |
+          echo "Waiting for tunnel config to be updated with route..."
+          timeout 60s bash -c 'until kubectl get configmap hello-world-gateway-${{ steps.e2e-id.outputs.E2E_ID }}-tunnel-config -n cloudflare-gateway-system -o jsonpath="{.data.config\.yaml}" | grep -q "cfgwc.george.dev"; do sleep 2; done'
+
+          echo "Restarting cloudflared to pick up new configuration..."
           kubectl delete pods -n cloudflare-gateway-system -l app=cloudflared
 
-          echo "=== Waiting for Gateway ConfigMap to be updated with route ==="
-          # Wait for the config to contain our hostname
-          timeout 60s bash -c 'until kubectl get configmap hello-world-gateway-${{ steps.e2e-id.outputs.E2E_ID }}-tunnel-config -n cloudflare-gateway-system -o jsonpath="{.data.config\.yaml}" | grep -q "testhw.george.dev"; do echo "Waiting for config update..."; sleep 2; done' || echo "Timeout waiting for config update"
-
-          echo -e "\n=== Checking tunnel config in ConfigMap ==="
-          kubectl get configmap hello-world-gateway-${{ steps.e2e-id.outputs.E2E_ID }}-tunnel-config -n cloudflare-gateway-system -o yaml || echo "ConfigMap not found"
-
-          echo -e "\n=== Tunnel config content ==="
-          kubectl get configmap hello-world-gateway-${{ steps.e2e-id.outputs.E2E_ID }}-tunnel-config -n cloudflare-gateway-system -o jsonpath='{.data.config\.yaml}' || echo "No config.yaml found"
-
-          echo -e "\n=== Waiting 30 seconds for tunnel connections to establish ==="
+          echo "Waiting for tunnel connections to establish..."
           sleep 30
-
-          echo -e "\n=== Checking cloudflared tunnel status ==="
-          kubectl logs -n cloudflare-gateway-system -l app=cloudflared,gateway=hello-world-gateway-${{ steps.e2e-id.outputs.E2E_ID }} --tail=50 || echo "No cloudflared logs"
 
       - name: Verify resources are created
         run: |
-          echo "=== GatewayClass ==="
           kubectl get gatewayclass cloudflare-${{ steps.e2e-id.outputs.E2E_ID }} -o yaml
-
-          echo -e "\n=== Gateway ==="
           kubectl get gateway hello-world-gateway-${{ steps.e2e-id.outputs.E2E_ID }} -n cloudflare-gateway-system -o yaml
-
-          echo -e "\n=== HTTPRoute ==="
           kubectl get httproute hello-world-${{ steps.e2e-id.outputs.E2E_ID }} -n hello-world -o yaml
-
-          echo -e "\n=== Controller Logs ==="
-          kubectl logs -n cloudflare-gateway-system -l app.kubernetes.io/name=cloudflare-gateway-controller --tail=100
 
       - name: Check controller health
         run: |
           kubectl get pods -n cloudflare-gateway-system -o wide
-          helm list -n cloudflare-gateway-system
-          kubectl describe deployment -n cloudflare-gateway-system -l app.kubernetes.io/name=cloudflare-gateway-controller
-
-      - name: Check cloudflared tunnel deployment
-        run: |
-          echo "=== Cloudflared Deployment ==="
-          kubectl get deployments -n cloudflare-gateway-system -l gateway=hello-world-gateway-${{ steps.e2e-id.outputs.E2E_ID }}
-          kubectl get pods -n cloudflare-gateway-system -l app=cloudflared,gateway=hello-world-gateway-${{ steps.e2e-id.outputs.E2E_ID }} -o wide || echo "No cloudflared pods found"
-
-          echo -e "\n=== Cloudflared Logs ==="
-          kubectl logs -n cloudflare-gateway-system -l app=cloudflared,gateway=hello-world-gateway-${{ steps.e2e-id.outputs.E2E_ID }} --tail=50 || echo "No cloudflared logs available"
-
-          echo -e "\n=== ConfigMaps ==="
-          kubectl get configmaps -n cloudflare-gateway-system -l gateway=hello-world-gateway-${{ steps.e2e-id.outputs.E2E_ID }}
-          kubectl describe configmap hello-world-gateway-${{ steps.e2e-id.outputs.E2E_ID }}-tunnel-config -n cloudflare-gateway-system || true
 
       - name: Test internal service connectivity
         run: |
-          echo "=== Testing service from within cluster ==="
           kubectl run curl-test --image=curlimages/curl:latest --rm -i --restart=Never -n hello-world -- \
-              sh -c '
-              RESPONSE_CODE=$(curl --location "http://hello-world.hello-world.svc.cluster.local:8080" \
-              --write-out "\n%{http_code}" --silent --show-error)
-              BODY=$(curl -vL --location "http://hello-world.hello-world.svc.cluster.local:8080" \
-              --show-error)
+            curl --fail --silent --show-error http://hello-world.hello-world.svc.cluster.local:8080
 
-              echo "Response Body:"
-              echo "${BODY}"
-              echo "Response Code:"
-              echo "${RESPONSE_CODE}"
-
-              if [[ "${RESPONSE_CODE}" != *"200" ]]; then
-                  echo "Expected HTTP 200 response but got different code."
-                  exit 1
-              fi
-              '
-
-      - name: Test public access to application and ensure 200 response
+      - name: Test public access to application
         run: |
-          echo "=== Testing public HTTPS access ==="
-          RESPONSE_CODE=$(curl --location 'https://testhw.george.dev' \
-          --write-out '\n%{http_code}' --silent --show-error)
-          BODY=$(curl -vL --location 'https://testhw.george.dev' \
-          --show-error)
-
-          echo "Response Body:"
-          echo "${BODY}"
-          echo "Response Code:"
-          echo "${RESPONSE_CODE}"
-
-          if [[ "${RESPONSE_CODE}" != *"200" ]]; then
-              echo "Expected HTTP 200 response but got different code."
-              exit 1
-          fi
-      - name: wait for 300 seconds
-        if: always()
-        run: sleep 300
+          curl --fail --silent --show-error https://cfgwc.george.dev
 
       - name: Export logs
         if: always()
         run: |
-          echo "=== All pods ==="
-          kubectl get pods --all-namespaces
+          echo "=== Controller logs ==="
+          kubectl logs -n cloudflare-gateway-system -l app.kubernetes.io/name=cloudflare-gateway-controller --tail=100 || true
 
-          echo -e "\n=== Helm releases ==="
-          helm list -A || true
-
-          echo -e "\n=== Controller logs ==="
-          kubectl logs -n cloudflare-gateway-system -l app.kubernetes.io/name=cloudflare-gateway-controller --tail=200 || true
-
-          echo -e "\n=== Hello World namespace pods ==="
-          kubectl get pods -n hello-world || true
+          echo -e "\n=== Cloudflared logs ==="
+          kubectl logs -n cloudflare-gateway-system -l app=cloudflared --tail=50 || true
 
           echo -e "\n=== Gateway resources ==="
           kubectl get gatewayclasses,gateways,httproutes --all-namespaces -o yaml || true
 
-          echo -e "\n=== Events ==="
-          kubectl get events --all-namespaces --sort-by='.lastTimestamp' || true
-
       - name: Cleanup Resources
         if: always()
         run: |
-          # delete application namespace
-          kubectl delete namespace hello-world || true
-
-          # uninstall helm chart
-          helm uninstall cloudflare-gateway-controller-${{ steps.e2e-id.outputs.E2E_ID }} -n cloudflare-gateway-system || true
+          kubectl delete namespace hello-world --ignore-not-found=true
+          helm uninstall cfgc-${{ steps.e2e-id.outputs.E2E_ID }} -n cloudflare-gateway-system --ignore-not-found || true
 
       - name: Cleanup Cluster
         if: always()
