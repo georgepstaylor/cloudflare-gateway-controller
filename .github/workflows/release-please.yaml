@@ -28,7 +28,7 @@ jobs:
   build-and-push:
     needs: release-please
     if: ${{ needs.release-please.outputs.release_created }}
-    uses: ./.github/workflows/build-image.yaml
+    uses: ./.github/workflows/build-image-reusable.yaml
     permissions:
       contents: read
       packages: write
