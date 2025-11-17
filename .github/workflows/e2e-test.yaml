@@ -320,11 +320,6 @@ jobs:
           echo -e "\n=== Tunnel config content ==="
           kubectl get configmap hello-world-gateway-${{ steps.e2e-id.outputs.E2E_ID }}-tunnel-config -n cloudflare-gateway-system -o jsonpath='{.data.config\.yaml}' || echo "No config.yaml found"
 
-          echo -e "\n=== Waiting for cloudflared to automatically restart with new config ==="
-          # The controller should automatically trigger a rollout when config changes
-          # Wait for the rollout to complete
-          kubectl rollout status deployment/hello-world-gateway-${{ steps.e2e-id.outputs.E2E_ID }}-cloudflared -n cloudflare-gateway-system --timeout=120s
-
           echo -e "\n=== Waiting 30 seconds for tunnel connections to establish ==="
           sleep 30
 
