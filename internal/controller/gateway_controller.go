@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"crypto/md5"
 	"fmt"
 	"strings"
 
@@ -669,7 +670,40 @@ func (r *GatewayReconciler) updateGatewayConfigFromRoutes(ctx context.Context, g
 
 	logger.Info("updated gateway config", "routes", len(routes), "rules", len(allRules))
 
+	// Update deployment annotation to trigger rollout when config changes
+	if err := r.updateDeploymentConfigHash(ctx, gateway, config); err != nil {
+		logger.Error(err, "failed to update deployment config hash")
+		// Don't fail the reconciliation - config is updated, deployment will pick it up eventually
+	}
+
 	return nil
+}
+
+// updateDeploymentConfigHash updates the cloudflared deployment with a hash of the config
+// This triggers an automatic rollout when the config changes
+func (r *GatewayReconciler) updateDeploymentConfigHash(ctx context.Context, gateway *gatewayv1.Gateway, config string) error {
+	deploymentName := fmt.Sprintf("%s-cloudflared", gateway.Name)
+	
+	// Calculate hash of the config
+	configHash := fmt.Sprintf("%x", md5.Sum([]byte(config)))[:10]
+	
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		deployment := &appsv1.Deployment{}
+		if err := r.Get(ctx, types.NamespacedName{
+			Name:      deploymentName,
+			Namespace: gateway.Namespace,
+		}, deployment); err != nil {
+			return err
+		}
+		
+		// Update the pod template annotation to trigger a rollout
+		if deployment.Spec.Template.Annotations == nil {
+			deployment.Spec.Template.Annotations = make(map[string]string)
+		}
+		deployment.Spec.Template.Annotations["cloudflare-gateway-controller/config-hash"] = configHash
+		
+		return r.Update(ctx, deployment)
+	})
 }
 
 // routeConflict represents a conflict between HTTPRoutes

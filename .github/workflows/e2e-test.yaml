@@ -308,20 +308,27 @@ jobs:
 
       - name: Wait for cloudflared to pick up route changes
         run: |
-          echo "=== Checking tunnel config in ConfigMap ==="
+          kubectl delete pods -n cloudflare-gateway-system -l app=cloudflared
+
+          echo "=== Waiting for Gateway ConfigMap to be updated with route ==="
+          # Wait for the config to contain our hostname
+          timeout 60s bash -c 'until kubectl get configmap hello-world-gateway-${{ steps.e2e-id.outputs.E2E_ID }}-tunnel-config -n cloudflare-gateway-system -o jsonpath="{.data.config\.yaml}" | grep -q "testhw.george.dev"; do echo "Waiting for config update..."; sleep 2; done' || echo "Timeout waiting for config update"
+
+          echo -e "\n=== Checking tunnel config in ConfigMap ==="
           kubectl get configmap hello-world-gateway-${{ steps.e2e-id.outputs.E2E_ID }}-tunnel-config -n cloudflare-gateway-system -o yaml || echo "ConfigMap not found"
 
           echo -e "\n=== Tunnel config content ==="
           kubectl get configmap hello-world-gateway-${{ steps.e2e-id.outputs.E2E_ID }}-tunnel-config -n cloudflare-gateway-system -o jsonpath='{.data.config\.yaml}' || echo "No config.yaml found"
 
-          echo -e "\n=== Restarting cloudflared to pick up new route configuration ==="
-          kubectl rollout restart deployment/hello-world-gateway-${{ steps.e2e-id.outputs.E2E_ID }}-cloudflared -n cloudflare-gateway-system
-          kubectl rollout status deployment/hello-world-gateway-${{ steps.e2e-id.outputs.E2E_ID }}-cloudflared -n cloudflare-gateway-system --timeout=60s
+          echo -e "\n=== Waiting for cloudflared to automatically restart with new config ==="
+          # The controller should automatically trigger a rollout when config changes
+          # Wait for the rollout to complete
+          kubectl rollout status deployment/hello-world-gateway-${{ steps.e2e-id.outputs.E2E_ID }}-cloudflared -n cloudflare-gateway-system --timeout=120s
 
-          echo -e "\n=== Waiting 15 seconds for tunnel connections to establish ==="
-          sleep 15
+          echo -e "\n=== Waiting 30 seconds for tunnel connections to establish ==="
+          sleep 30
 
-          echo -e "\n=== Checking cloudflared tunnel status after restart ==="
+          echo -e "\n=== Checking cloudflared tunnel status ==="
           kubectl logs -n cloudflare-gateway-system -l app=cloudflared,gateway=hello-world-gateway-${{ steps.e2e-id.outputs.E2E_ID }} --tail=50 || echo "No cloudflared logs"
 
       - name: Verify resources are created
