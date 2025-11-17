@@ -14,7 +14,7 @@ COPY internal/ internal/
 # Build using build args from buildx
 ARG TARGETOS
 ARG TARGETARCH
-RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -o manager cmd/main.go
+RUN GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -o manager cmd/main.go
 
 # Runtime stage
 FROM gcr.io/distroless/static:nonroot

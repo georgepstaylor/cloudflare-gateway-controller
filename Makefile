@@ -33,7 +33,7 @@ help: ## Display this help.
 
 .PHONY: manifests
 manifests: controller-gen ## Generate RBAC manifests (to copy to Helm chart repo).
-	@$(CONTROLLER_GEN) rbac:roleName=cloudflare-gateway-system-cloudflare-gateway-controller-role paths="./internal/controller/..." output:rbac:artifacts:config=config/rbac
+	@$(CONTROLLER_GEN) rbac:roleName=cloudflare-gateway-system-cloudflare-gateway-controller-role paths="./cmd/...;./internal/controller/..." output:rbac:artifacts:config=config/rbac
 
 .PHONY: generate
 generate: controller-gen ## Generate code containing DeepCopy, DeepCopyInto, and DeepCopyObject method implementations.
