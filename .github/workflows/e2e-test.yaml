@@ -1,387 +1,389 @@
 name: E2E Tests
 
 on:
-    pull_request:
-        branches: [main]
-    push:
-        branches: [main]
-    workflow_dispatch:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
 
 env:
-    GO_VERSION: "1.24"
-    KIND_VERSION: "v0.25.0"
-    KUBECTL_VERSION: "v1.31.0"
-    HELM_VERSION: "v3.16.3"
-    GATEWAY_API_VERSION: "v1.4.0"
+  GO_VERSION: "1.24"
+  KIND_VERSION: "v0.25.0"
+  KUBECTL_VERSION: "v1.31.0"
+  HELM_VERSION: "v3.16.3"
+  GATEWAY_API_VERSION: "v1.4.0"
 
 jobs:
-    build-image:
-        name: Build Controller Image
-        uses: ./.github/workflows/build-image-reusable.yaml
-        permissions:
-            contents: read
-            packages: write
+  build-image:
+    name: Build Controller Image
+    uses: ./.github/workflows/build-image-reusable.yaml
+    permissions:
+      contents: read
+      packages: write
+    with:
+      push: true
+      platforms: linux/amd64
+      tags: |
+        type=ref,event=pr
+        type=ref,event=branch
+        type=sha
+
+  e2e-test:
+    name: End-to-End Tests
+    runs-on: ubuntu-latest
+    needs: build-image
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Generate E2E test identifier
+        id: e2e-id
+        run: |
+          echo "E2E_ID=$(date +%s)" >> $GITHUB_OUTPUT
+
+      - name: Get Secrets
+        uses: bitwarden/sm-action@v2
         with:
-            push: true
-            platforms: linux/amd64
-            tags: |
-                type=ref,event=pr
-                type=ref,event=branch
-                type=sha
+          cloud_region: eu
+          access_token: ${{ secrets.BW_ACCESS_TOKEN }}
+          secrets: |
+            0bf9c2bd-f0d6-43f0-be07-b39400060b83 > CLOUDFLARE_ACCOUNT_ID
+            8305fd5c-2b7f-482d-8174-b393010e3a32 > CLOUDFLARE_API_TOKEN
 
-    e2e-test:
-        name: End-to-End Tests
-        runs-on: ubuntu-latest
-        needs: build-image
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
 
-        steps:
-            - name: Checkout code
-              uses: actions/checkout@v4
+      - name: Install kubectl
+        run: |
+          curl -LO "https://dl.k8s.io/release/${{ env.KUBECTL_VERSION }}/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/
+          kubectl version --client
 
-            - name: Generate E2E test identifier
-              id: e2e-id
-              run: |
-                  echo "E2E_ID=$(date +%s)" >> $GITHUB_OUTPUT
+      - name: Install kind
+        run: |
+          curl -Lo ./kind "https://kind.sigs.k8s.io/dl/${{ env.KIND_VERSION }}/kind-linux-amd64"
+          chmod +x ./kind
+          sudo mv ./kind /usr/local/bin/kind
+          kind version
 
-            - name: Get Secrets
-              uses: bitwarden/sm-action@v2
-              with:
-                  cloud_region: eu
-                  access_token: ${{ secrets.BW_ACCESS_TOKEN }}
-                  secrets: |
-                      0bf9c2bd-f0d6-43f0-be07-b39400060b83 > CLOUDFLARE_ACCOUNT_ID
-                      8305fd5c-2b7f-482d-8174-b393010e3a32 > CLOUDFLARE_API_TOKEN
+      - name: Install Helm
+        uses: azure/setup-helm@v4.3.0
+        id: install
 
-            - name: Set up Go
-              uses: actions/setup-go@v5
-              with:
-                  go-version: ${{ env.GO_VERSION }}
-                  cache: true
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
-            - name: Install kubectl
-              run: |
-                  curl -LO "https://dl.k8s.io/release/${{ env.KUBECTL_VERSION }}/bin/linux/amd64/kubectl"
-                  chmod +x kubectl
-                  sudo mv kubectl /usr/local/bin/
-                  kubectl version --client
+      - name: Create kind cluster
+        run: |
+          cat <<EOF | kind create cluster --config=-
+          kind: Cluster
+          apiVersion: kind.x-k8s.io/v1alpha4
+          name: cloudflare-gateway-e2e
+          nodes:
+          - role: control-plane
+            image: kindest/node:v1.31.0
+          - role: worker
+            image: kindest/node:v1.31.0
+          EOF
 
-            - name: Install kind
-              run: |
-                  curl -Lo ./kind "https://kind.sigs.k8s.io/dl/${{ env.KIND_VERSION }}/kind-linux-amd64"
-                  chmod +x ./kind
-                  sudo mv ./kind /usr/local/bin/kind
-                  kind version
+          kubectl cluster-info
+          kubectl get nodes
 
-            - name: Install Helm
-              uses: azure/setup-helm@v4.3.0
-              id: install
+      - name: Install Gateway API CRDs
+        run: |
+          kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/${{ env.GATEWAY_API_VERSION }}/standard-install.yaml
+          kubectl wait --for condition=established --timeout=60s crd/gatewayclasses.gateway.networking.k8s.io
+          kubectl wait --for condition=established --timeout=60s crd/gateways.gateway.networking.k8s.io
+          kubectl wait --for condition=established --timeout=60s crd/httproutes.gateway.networking.k8s.io
 
-            - name: Log in to Container Registry
-              uses: docker/login-action@v3
-              with:
-                  registry: ghcr.io
-                  username: ${{ github.actor }}
-                  password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Pull and load Docker image into kind
+        run: |
+          IMAGE_TAG="${{ needs.build-image.outputs.image-tag }}"
+          echo "Using image: ghcr.io/${{ github.repository }}:${IMAGE_TAG}"
 
-            - name: Create kind cluster
-              run: |
-                  cat <<EOF | kind create cluster --config=-
-                  kind: Cluster
-                  apiVersion: kind.x-k8s.io/v1alpha4
-                  name: cloudflare-gateway-e2e
-                  nodes:
-                  - role: control-plane
-                    image: kindest/node:v1.31.0
-                  - role: worker
-                    image: kindest/node:v1.31.0
-                  EOF
+          docker pull "ghcr.io/${{ github.repository }}:${IMAGE_TAG}"
+          kind load docker-image "ghcr.io/${{ github.repository }}:${IMAGE_TAG}" --name cloudflare-gateway-e2e
 
-                  kubectl cluster-info
-                  kubectl get nodes
+      - name: Add Helm repository and install controller
+        run: |
+          IMAGE_TAG="${{ needs.build-image.outputs.image-tag }}"
 
-            - name: Install Gateway API CRDs
-              run: |
-                  kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/${{ env.GATEWAY_API_VERSION }}/standard-install.yaml
-                  kubectl wait --for condition=established --timeout=60s crd/gatewayclasses.gateway.networking.k8s.io
-                  kubectl wait --for condition=established --timeout=60s crd/gateways.gateway.networking.k8s.io
-                  kubectl wait --for condition=established --timeout=60s crd/httproutes.gateway.networking.k8s.io
+          helm repo add cloudflare-gateway-controller https://georgepstaylor.github.io/cloudflare-gateway-controller-helm-charts
+          helm repo update
 
-            - name: Pull and load Docker image into kind
-              run: |
-                  IMAGE_TAG="${{ needs.build-image.outputs.image-tag }}"
-                  echo "Using image: ghcr.io/${{ github.repository }}:${IMAGE_TAG}"
+          helm install cfgc-${{ steps.e2e-id.outputs.E2E_ID }} \
+            cloudflare-gateway-controller/cloudflare-gateway-controller \
+            --namespace cloudflare-gateway-system \
+            --create-namespace \
+            --set image.repository=ghcr.io/${{ github.repository }} \
+            --set image.tag="${IMAGE_TAG}" \
+            --set image.pullPolicy=IfNotPresent \
+            --set cloudflare.apiToken=${{ env.CLOUDFLARE_API_TOKEN }} \
+            --set cloudflare.accountId=${{ env.CLOUDFLARE_ACCOUNT_ID }} \
+            --wait --timeout=2m
 
-                  docker pull "ghcr.io/${{ github.repository }}:${IMAGE_TAG}"
-                  kind load docker-image "ghcr.io/${{ github.repository }}:${IMAGE_TAG}" --name cloudflare-gateway-e2e
+      - name: Verify controller is running
+        run: |
+          kubectl get pods -n cloudflare-gateway-system
+          kubectl logs -n cloudflare-gateway-system -l app.kubernetes.io/name=cloudflare-gateway-controller --tail=50
 
-            - name: Add Helm repository and install controller
-              run: |
-                  IMAGE_TAG="${{ needs.build-image.outputs.image-tag }}"
+      - name: Create test namespace
+        run: |
+          kubectl create namespace hello-world
 
-                  helm repo add cloudflare-gateway-controller https://georgepstaylor.github.io/cloudflare-gateway-controller-helm-charts
-                  helm repo update
+      - name: Create GatewayClass
+        run: |
+          cat <<EOF | kubectl apply -f -
+          apiVersion: gateway.networking.k8s.io/v1
+          kind: GatewayClass
+          metadata:
+            name: cloudflare-${{ steps.e2e-id.outputs.E2E_ID }}
+          spec:
+            controllerName: george.dev/cloudflare-gateway-controller
+            parametersRef:
+              group: ""
+              kind: Secret
+              name: cloudflare-credentials
+              namespace: cloudflare-gateway-system
+          EOF
 
-                  helm install cfgc-${{ steps.e2e-id.outputs.E2E_ID }} \
-                    cloudflare-gateway-controller/cloudflare-gateway-controller \
-                    --namespace cloudflare-gateway-system \
-                    --create-namespace \
-                    --set image.repository=ghcr.io/${{ github.repository }} \
-                    --set image.tag="${IMAGE_TAG}" \
-                    --set image.pullPolicy=IfNotPresent \
-                    --set cloudflare.apiToken=${{ env.CLOUDFLARE_API_TOKEN }} \
-                    --set cloudflare.accountId=${{ env.CLOUDFLARE_ACCOUNT_ID }} \
-                    --wait --timeout=2m
+      - name: Wait for GatewayClass to be accepted
+        run: |
+          timeout 60s bash -c 'until kubectl get gatewayclass cloudflare-${{ steps.e2e-id.outputs.E2E_ID }} -o jsonpath="{.status.conditions[?(@.type==\"Accepted\")].status}" | grep -q "True"; do sleep 2; done' || true
+          kubectl get gatewayclass cloudflare-${{ steps.e2e-id.outputs.E2E_ID }} -o yaml
 
-            - name: Verify controller is running
-              run: |
-                  kubectl get pods -n cloudflare-gateway-system
-                  kubectl logs -n cloudflare-gateway-system -l app.kubernetes.io/name=cloudflare-gateway-controller --tail=50
+      - name: Create Gateway
+        run: |
+          cat <<EOF | kubectl apply -f -
+          apiVersion: gateway.networking.k8s.io/v1
+          kind: Gateway
+          metadata:
+            name: hello-world-gateway-${{ steps.e2e-id.outputs.E2E_ID }}
+            namespace: hello-world
+          spec:
+            gatewayClassName: cloudflare-${{ steps.e2e-id.outputs.E2E_ID }}
+            listeners:
+              - name: http
+                protocol: HTTP
+                port: 80
+          EOF
 
-            - name: Create test namespace
-              run: |
-                  kubectl create namespace hello-world
+      - name: Wait for Gateway to be programmed
+        run: |
+          timeout 60s bash -c 'until kubectl get gateway hello-world-gateway-${{ steps.e2e-id.outputs.E2E_ID }} -n hello-world -o jsonpath="{.status.conditions[?(@.type==\"Programmed\")].status}" | grep -q "True"; do sleep 2; done' || true
+          kubectl get gateway hello-world-gateway-${{ steps.e2e-id.outputs.E2E_ID }} -n hello-world -o yaml
 
-            - name: Create GatewayClass
-              run: |
-                  cat <<EOF | kubectl apply -f -
-                  apiVersion: gateway.networking.k8s.io/v1
-                  kind: GatewayClass
-                  metadata:
-                    name: cloudflare-${{ steps.e2e-id.outputs.E2E_ID }}
-                  spec:
-                    controllerName: george.dev/cloudflare-gateway-controller
-                    parametersRef:
-                      group: ""
-                      kind: Secret
-                      name: cloudflare-credentials
-                      namespace: cloudflare-gateway-system
-                  EOF
+      - name: Deploy test application
+        run: |
+          kubectl apply -f - <<EOF
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: hello-world
+            namespace: hello-world
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: hello-world
+            template:
+              metadata:
+                labels:
+                  app: hello-world
+              spec:
+                containers:
+                - name: hello-world
+                  image: gcr.io/google-samples/hello-app:1.0
+                  ports:
+                    - containerPort: 8080
+                      name: http
+                  env:
+                    - name: PORT
+                      value: "8080"
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: hello-world
+            namespace: hello-world
+          spec:
+            selector:
+              app: hello-world
+            ports:
+            - protocol: TCP
+              port: 8080
+              targetPort: 8080
+          EOF
 
-            - name: Wait for GatewayClass to be accepted
-              run: |
-                  timeout 60s bash -c 'until kubectl get gatewayclass cloudflare-${{ steps.e2e-id.outputs.E2E_ID }} -o jsonpath="{.status.conditions[?(@.type==\"Accepted\")].status}" | grep -q "True"; do sleep 2; done' || true
-                  kubectl get gatewayclass cloudflare-${{ steps.e2e-id.outputs.E2E_ID }} -o yaml
+      - name: Wait for application to be ready
+        run: |
+          kubectl wait --for=condition=available --timeout=120s \
+            deployment/hello-world -n hello-world
+          kubectl get pods -n hello-world
 
-            - name: Create Gateway
-              run: |
-                  cat <<EOF | kubectl apply -f -
-                  apiVersion: gateway.networking.k8s.io/v1
-                  kind: Gateway
-                  metadata:
-                    name: hello-world-gateway-${{ steps.e2e-id.outputs.E2E_ID }}
-                    namespace: hello-world
-                  spec:
-                    gatewayClassName: cloudflare-${{ steps.e2e-id.outputs.E2E_ID }}
-                    listeners:
-                      - name: http
-                        protocol: HTTP
-                        port: 80
-                  EOF
+      - name: Create HTTPRoute
+        run: |
+          cat <<EOF | kubectl apply -f -
+          apiVersion: gateway.networking.k8s.io/v1
+          kind: HTTPRoute
+          metadata:
+            name: hello-world-${{ steps.e2e-id.outputs.E2E_ID }}
+            namespace: hello-world
+          spec:
+            parentRefs:
+              - name: hello-world-gateway-${{ steps.e2e-id.outputs.E2E_ID }}
+                namespace: hello-world
+            hostnames:
+              - "cfgc.george.dev"
+            rules:
+              - matches:
+                  - path:
+                      type: PathPrefix
+                      value: /
+                backendRefs:
+                  - name: hello-world
+                    port: 8080
+          EOF
 
-            - name: Wait for Gateway to be programmed
-              run: |
-                  timeout 60s bash -c 'until kubectl get gateway hello-world-gateway-${{ steps.e2e-id.outputs.E2E_ID }} -n hello-world -o jsonpath="{.status.conditions[?(@.type==\"Programmed\")].status}" | grep -q "True"; do sleep 2; done' || true
-                  kubectl get gateway hello-world-gateway-${{ steps.e2e-id.outputs.E2E_ID }} -n hello-world -o yaml
+      - name: Wait for HTTPRoute to be accepted
+        run: |
+          timeout 60s bash -c 'until kubectl get httproute hello-world-${{ steps.e2e-id.outputs.E2E_ID }} -n hello-world -o jsonpath="{.status.parents[0].conditions[?(@.type==\"Accepted\")].status}" | grep -q "True"; do sleep 2; done' || true
+          kubectl get httproute hello-world-${{ steps.e2e-id.outputs.E2E_ID }} -n hello-world -o yaml
 
-            - name: Deploy test application
-              run: |
-                  kubectl apply -f - <<EOF
-                  apiVersion: apps/v1
-                  kind: Deployment
-                  metadata:
-                    name: hello-world
-                    namespace: hello-world
-                  spec:
-                    replicas: 1
-                    selector:
-                      matchLabels:
-                        app: hello-world
-                    template:
-                      metadata:
-                        labels:
-                          app: hello-world
-                      spec:
-                        containers:
-                        - name: hello-world
-                          image: gcr.io/google-samples/hello-app:1.0
-                          ports:
-                            - containerPort: 8080
-                              name: http
-                          env:
-                            - name: PORT
-                              value: "8080"
-                  ---
-                  apiVersion: v1
-                  kind: Service
-                  metadata:
-                    name: hello-world
-                    namespace: hello-world
-                  spec:
-                    selector:
-                      app: hello-world
-                    ports:
-                    - protocol: TCP
-                      port: 8080
-                      targetPort: 8080
-                  EOF
+      - name: Wait for cloudflared to pick up route changes
+        run: |
+          echo "=== Checking tunnel config in ConfigMap ==="
+          kubectl get configmap hello-world-gateway-${{ steps.e2e-id.outputs.E2E_ID }}-tunnel-config -n hello-world -o yaml || echo "ConfigMap not found"
 
-            - name: Wait for application to be ready
-              run: |
-                  kubectl wait --for=condition=available --timeout=120s \
-                    deployment/hello-world -n hello-world
-                  kubectl get pods -n hello-world
+          echo -e "\n=== Tunnel config content ==="
+          kubectl get configmap hello-world-gateway-${{ steps.e2e-id.outputs.E2E_ID }}-tunnel-config -n hello-world -o jsonpath='{.data.config\.yaml}' || echo "No config.yaml found"
 
-            - name: Create HTTPRoute
-              run: |
-                  cat <<EOF | kubectl apply -f -
-                  apiVersion: gateway.networking.k8s.io/v1
-                  kind: HTTPRoute
-                  metadata:
-                    name: hello-world-${{ steps.e2e-id.outputs.E2E_ID }}
-                    namespace: hello-world
-                  spec:
-                    parentRefs:
-                      - name: hello-world-gateway-${{ steps.e2e-id.outputs.E2E_ID }}
-                        namespace: hello-world
-                    hostnames:
-                      - "cfgc.george.dev"
-                    rules:
-                      - matches:
-                          - path:
-                              type: PathPrefix
-                              value: /
-                        backendRefs:
-                          - name: hello-world
-                            port: 8080
-                  EOF
+          echo -e "\n=== Restarting cloudflared to pick up new route configuration ==="
+          kubectl rollout restart deployment/hello-world-gateway-${{ steps.e2e-id.outputs.E2E_ID }}-cloudflared -n hello-world
+          kubectl rollout status deployment/hello-world-gateway-${{ steps.e2e-id.outputs.E2E_ID }}-cloudflared -n hello-world --timeout=60s
 
-            - name: Wait for HTTPRoute to be accepted
-              run: |
-                  timeout 60s bash -c 'until kubectl get httproute hello-world-${{ steps.e2e-id.outputs.E2E_ID }} -n hello-world -o jsonpath="{.status.parents[0].conditions[?(@.type==\"Accepted\")].status}" | grep -q "True"; do sleep 2; done' || true
-                  kubectl get httproute hello-world-${{ steps.e2e-id.outputs.E2E_ID }} -n hello-world -o yaml
+          echo -e "\n=== Waiting 15 seconds for tunnel connections to establish ==="
+          sleep 15
 
-            - name: Wait for cloudflared to pick up route changes
-              run: |
-                  echo "=== Checking tunnel config in ConfigMap ==="
-                  kubectl get configmap hello-world-gateway-${{ steps.e2e-id.outputs.E2E_ID }}-tunnel-config -n hello-world -o yaml || echo "ConfigMap not found"
+          echo -e "\n=== Checking cloudflared tunnel status after restart ==="
+          kubectl logs -n hello-world -l app=cloudflared --tail=50 || echo "No cloudflared logs"
 
-                  echo -e "\n=== Tunnel config content ==="
-                  kubectl get configmap hello-world-gateway-${{ steps.e2e-id.outputs.E2E_ID }}-tunnel-config -n hello-world -o jsonpath='{.data.config\.yaml}' || echo "No config.yaml found"
+      - name: Verify resources are created
+        run: |
+          echo "=== GatewayClass ==="
+          kubectl get gatewayclass cloudflare-${{ steps.e2e-id.outputs.E2E_ID }} -o yaml
 
-                  echo -e "\n=== Restarting cloudflared to pick up new route configuration ==="
-                  kubectl rollout restart deployment/hello-world-gateway-${{ steps.e2e-id.outputs.E2E_ID }}-cloudflared -n hello-world
-                  kubectl rollout status deployment/hello-world-gateway-${{ steps.e2e-id.outputs.E2E_ID }}-cloudflared -n hello-world --timeout=60s
+          echo -e "\n=== Gateway ==="
+          kubectl get gateway hello-world-gateway-${{ steps.e2e-id.outputs.E2E_ID }} -n hello-world -o yaml
 
-                  echo -e "\n=== Waiting 15 seconds for tunnel connections to establish ==="
-                  sleep 15
+          echo -e "\n=== HTTPRoute ==="
+          kubectl get httproute hello-world-${{ steps.e2e-id.outputs.E2E_ID }} -n hello-world -o yaml
 
-                  echo -e "\n=== Checking cloudflared tunnel status after restart ==="
-                  kubectl logs -n hello-world -l app=cloudflared --tail=50 || echo "No cloudflared logs"
+          echo -e "\n=== Controller Logs ==="
+          kubectl logs -n cloudflare-gateway-system -l app.kubernetes.io/name=cloudflare-gateway-controller --tail=100
 
-            - name: Verify resources are created
-              run: |
-                  echo "=== GatewayClass ==="
-                  kubectl get gatewayclass cloudflare-${{ steps.e2e-id.outputs.E2E_ID }} -o yaml
+      - name: Check controller health
+        run: |
+          kubectl get pods -n cloudflare-gateway-system -o wide
+          helm list -n cloudflare-gateway-system
+          kubectl describe deployment -n cloudflare-gateway-system -l app.kubernetes.io/name=cloudflare-gateway-controller
 
-                  echo -e "\n=== Gateway ==="
-                  kubectl get gateway hello-world-gateway-${{ steps.e2e-id.outputs.E2E_ID }} -n hello-world -o yaml
+      - name: Check cloudflared tunnel deployment
+        run: |
+          echo "=== Cloudflared Deployment ==="
+          kubectl get deployments -n hello-world
+          kubectl get pods -n hello-world -l app=cloudflared -o wide || echo "No cloudflared pods found"
 
-                  echo -e "\n=== HTTPRoute ==="
-                  kubectl get httproute hello-world-${{ steps.e2e-id.outputs.E2E_ID }} -n hello-world -o yaml
+          echo -e "\n=== Cloudflared Logs ==="
+          kubectl logs -n hello-world -l app=cloudflared --tail=50 || echo "No cloudflared logs available"
 
-                  echo -e "\n=== Controller Logs ==="
-                  kubectl logs -n cloudflare-gateway-system -l app.kubernetes.io/name=cloudflare-gateway-controller --tail=100
+          echo -e "\n=== ConfigMaps ==="
+          kubectl get configmaps -n hello-world
+          kubectl describe configmap -n hello-world || true
 
-            - name: Check controller health
-              run: |
-                  kubectl get pods -n cloudflare-gateway-system -o wide
-                  helm list -n cloudflare-gateway-system
-                  kubectl describe deployment -n cloudflare-gateway-system -l app.kubernetes.io/name=cloudflare-gateway-controller
+      - name: Test internal service connectivity
+        run: |
+          echo "=== Testing service from within cluster ==="
+          kubectl run curl-test --image=curlimages/curl:latest --rm -i --restart=Never -n hello-world -- \
+              sh -c '
+              RESPONSE_CODE=$(curl --location "http://hello-world.hello-world.svc.cluster.local:8080" \
+              --write-out "\n%{http_code}" --silent --show-error)
+              BODY=$(curl -vL --location "http://hello-world.hello-world.svc.cluster.local:8080" \
+              --show-error)
 
-            - name: Check cloudflared tunnel deployment
-              run: |
-                  echo "=== Cloudflared Deployment ==="
-                  kubectl get deployments -n hello-world
-                  kubectl get pods -n hello-world -l app=cloudflared -o wide || echo "No cloudflared pods found"
+              echo "Response Body:"
+              echo "${BODY}"
+              echo "Response Code:"
+              echo "${RESPONSE_CODE}"
 
-                  echo -e "\n=== Cloudflared Logs ==="
-                  kubectl logs -n hello-world -l app=cloudflared --tail=50 || echo "No cloudflared logs available"
+              if [[ "${RESPONSE_CODE}" != *"200" ]]; then
+                  echo "Expected HTTP 200 response but got different code."
+                  exit 1
+              fi
+              '
 
-                  echo -e "\n=== ConfigMaps ==="
-                  kubectl get configmaps -n hello-world
-                  kubectl describe configmap -n hello-world || true
+      - name: Test public access to application and ensure 200 response
+        run: |
+          echo "=== Testing public HTTPS access ==="
+          RESPONSE_CODE=$(curl --location 'https://cfgc.george.dev' \
+          --write-out '\n%{http_code}' --silent --show-error)
+          BODY=$(curl -vL --location 'https://cfgc.george.dev' \
+          --show-error)
 
-            - name: Test internal service connectivity
-              run: |
-                  echo "=== Testing service from within cluster ==="
-                  kubectl run curl-test --image=curlimages/curl:latest --rm -i --restart=Never -n hello-world -- \
-                      sh -c '
-                      RESPONSE_CODE=$(curl --location "http://hello-world.hello-world.svc.cluster.local:8080" \
-                      --write-out "\n%{http_code}" --silent --show-error)
-                      BODY=$(curl -vL --location "http://hello-world.hello-world.svc.cluster.local:8080" \
-                      --show-error)
+          echo "Response Body:"
+          echo "${BODY}"
+          echo "Response Code:"
+          echo "${RESPONSE_CODE}"
 
-                      echo "Response Body:"
-                      echo "${BODY}"
-                      echo "Response Code:"
-                      echo "${RESPONSE_CODE}"
+          if [[ "${RESPONSE_CODE}" != *"200" ]]; then
+              echo "Expected HTTP 200 response but got different code."
+              exit 1
+          fi
+      - name: wait for 300 seconds
+        if: always()
+        run: sleep 300
 
-                      if [[ "${RESPONSE_CODE}" != *"200" ]]; then
-                          echo "Expected HTTP 200 response but got different code."
-                          exit 1
-                      fi
-                      '
+      - name: Export logs
+        if: always()
+        run: |
+          echo "=== All pods ==="
+          kubectl get pods --all-namespaces
 
-            - name: Test public access to application and ensure 200 response
-              run: |
-                  echo "=== Testing public HTTPS access ==="
-                  RESPONSE_CODE=$(curl --location 'https://cfgc.george.dev' \
-                  --write-out '\n%{http_code}' --silent --show-error)
-                  BODY=$(curl -vL --location 'https://cfgc.george.dev' \
-                  --show-error)
+          echo -e "\n=== Helm releases ==="
+          helm list -A || true
 
-                  echo "Response Body:"
-                  echo "${BODY}"
-                  echo "Response Code:"
-                  echo "${RESPONSE_CODE}"
+          echo -e "\n=== Controller logs ==="
+          kubectl logs -n cloudflare-gateway-system -l app.kubernetes.io/name=cloudflare-gateway-controller --tail=200 || true
 
-                  if [[ "${RESPONSE_CODE}" != *"200" ]]; then
-                      echo "Expected HTTP 200 response but got different code."
-                      exit 1
-                  fi
-            - name: wait for 300 seconds
-              run: sleep 300
-            - name: Export logs
-              if: always()
-              run: |
-                  echo "=== All pods ==="
-                  kubectl get pods --all-namespaces
+          echo -e "\n=== Hello World namespace pods ==="
+          kubectl get pods -n hello-world || true
 
-                  echo -e "\n=== Helm releases ==="
-                  helm list -A || true
+          echo -e "\n=== Gateway resources ==="
+          kubectl get gatewayclasses,gateways,httproutes --all-namespaces -o yaml || true
 
-                  echo -e "\n=== Controller logs ==="
-                  kubectl logs -n cloudflare-gateway-system -l app.kubernetes.io/name=cloudflare-gateway-controller --tail=200 || true
+          echo -e "\n=== Events ==="
+          kubectl get events --all-namespaces --sort-by='.lastTimestamp' || true
 
-                  echo -e "\n=== Hello World namespace pods ==="
-                  kubectl get pods -n hello-world || true
+      - name: Cleanup Resources
+        if: always()
+        run: |
+          # delete application namespace
+          kubectl delete namespace hello-world || true
 
-                  echo -e "\n=== Gateway resources ==="
-                  kubectl get gatewayclasses,gateways,httproutes --all-namespaces -o yaml || true
+          # uninstall helm chart
+          helm uninstall cloudflare-gateway-controller-${{ steps.e2e-id.outputs.E2E_ID }} -n cloudflare-gateway-system || true
 
-                  echo -e "\n=== Events ==="
-                  kubectl get events --all-namespaces --sort-by='.lastTimestamp' || true
-
-            - name: Cleanup Resources
-              if: always()
-              run: |
-                  # delete application namespace
-                  kubectl delete namespace hello-world || true
-
-                  # uninstall helm chart
-                  helm uninstall cloudflare-gateway-controller-${{ steps.e2e-id.outputs.E2E_ID }} -n cloudflare-gateway-system || true
-
-            - name: Cleanup Cluster
-              if: always()
-              run: |
-                  kind delete cluster --name cloudflare-gateway-e2e || true
+      - name: Cleanup Cluster
+        if: always()
+        run: |
+          kind delete cluster --name cloudflare-gateway-e2e || true
