@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.2.0](https://github.com/georgepstaylor/cloudflare-gateway-controller/compare/cloudflare-gateway-controller-v0.1.7...cloudflare-gateway-controller-v0.2.0) (2025-11-18)
+
+
+### Features
+
+* **controller:** detect conflicting HTTPRoute host/path rules and dont accept them ([5c21d79](https://github.com/georgepstaylor/cloudflare-gateway-controller/commit/5c21d793e3cabf559fc60015796efa6a0083fa3d))
+* **controller:** move tunnel config reconciliation from httproute to gateway ([982eae2](https://github.com/georgepstaylor/cloudflare-gateway-controller/commit/982eae249a80fdd4117bbeba28d3ea90e4603aca))
+* enable comment on managed DNS records ([2766842](https://github.com/georgepstaylor/cloudflare-gateway-controller/commit/27668420b7a78c18cc3c73a26123fcd93233c6b4))
+
+
+### Bug Fixes
+
+* httproute&lt;-&gt;gateway uncoupling ([6548356](https://github.com/georgepstaylor/cloudflare-gateway-controller/commit/65483568d5ca024c8c76f881d37309c50f0c866a))
+* reconciliation conflicts ([64be630](https://github.com/georgepstaylor/cloudflare-gateway-controller/commit/64be6303a9b719ac628cb144f2a590deb9b21a9b))
+* tunnel should be configured as local ([e3f8868](https://github.com/georgepstaylor/cloudflare-gateway-controller/commit/e3f8868c440d42e627ae160564640797950f3a68))
+
 ## [0.1.7](https://github.com/georgepstaylor/cloudflare-gateway-controller/compare/cloudflare-gateway-controller-v0.1.6...cloudflare-gateway-controller-v0.1.7) (2025-11-14)
 
 
