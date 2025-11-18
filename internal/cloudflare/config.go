@@ -94,10 +94,10 @@ func (g *ConfigGenerator) GenerateConfig(tunnelID string, rules []IngressRule) (
 // GenerateCredentialsJSON creates the credentials file content for cloudflared
 func (g *ConfigGenerator) GenerateCredentialsJSON(accountID, tunnelID, tunnelSecret string) string {
 	return fmt.Sprintf(`{
-  "AccountTag": "%s",
-  "TunnelID": "%s",
-  "TunnelSecret": "%s"
-}`, accountID, tunnelID, tunnelSecret)
+		"AccountTag": "%s",
+		"TunnelID": "%s",
+		"TunnelSecret": "%s"
+	}`, accountID, tunnelID, tunnelSecret)
 }
 
 // IngressRuleBuilder helps build ingress rules from HTTPRoute specifications
