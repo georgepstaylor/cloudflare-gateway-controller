@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.1](https://github.com/georgepstaylor/cloudflare-gateway-controller/compare/cloudflare-gateway-controller-v0.2.0...cloudflare-gateway-controller-v0.2.1) (2025-11-20)
+
+
+### Bug Fixes
+
+* **cmd:** register Gateway API scheme using gatewayv1.Install ([54bcdc3](https://github.com/georgepstaylor/cloudflare-gateway-controller/commit/54bcdc329f1a44990b6d98fb3275c08dedf704c5))
+
 ## [0.2.0](https://github.com/georgepstaylor/cloudflare-gateway-controller/compare/cloudflare-gateway-controller-v0.1.7...cloudflare-gateway-controller-v0.2.0) (2025-11-18)
 
 
