@@ -175,7 +175,7 @@ func (r *GatewayReconciler) reconcileGateway(ctx context.Context, gateway *gatew
 	}
 
 	// Create or update ConfigMap with tunnel configuration
-	if err := r.reconcileConfigMap(ctx, gateway); err != nil {
+	if err := r.reconcileConfigMap(ctx, gateway, tunnelID); err != nil {
 		return fmt.Errorf("failed to reconcile configmap: %w", err)
 	}
 
@@ -339,8 +339,7 @@ func (r *GatewayReconciler) reconcileCredentialsSecret(ctx context.Context, gate
 			secret.Data["tunnel-name"] = []byte(tunnelName)
 
 			// Generate credentials JSON
-			generator := cloudflare.NewConfigGenerator()
-			credentialsJSON := generator.GenerateCredentialsJSON(accountID, tunnelID, tunnelSecret)
+			credentialsJSON := cloudflare.GenerateCredentialsJSON(accountID, tunnelID, tunnelSecret)
 			secret.Data["credentials.json"] = []byte(credentialsJSON)
 			secret.Type = corev1.SecretTypeOpaque
 
@@ -351,7 +350,7 @@ func (r *GatewayReconciler) reconcileCredentialsSecret(ctx context.Context, gate
 	})
 }
 
-func (r *GatewayReconciler) reconcileConfigMap(ctx context.Context, gateway *gatewayv1.Gateway) error {
+func (r *GatewayReconciler) reconcileConfigMap(ctx context.Context, gateway *gatewayv1.Gateway, tunnelID string) error {
 	configMapName := fmt.Sprintf("%s-tunnel-config", gateway.Name)
 
 	// Use retry logic to handle concurrent modifications
@@ -371,20 +370,8 @@ func (r *GatewayReconciler) reconcileConfigMap(ctx context.Context, gateway *gat
 			// Only initialize config if it doesn't exist yet
 			// HTTPRoute controller will update it with actual routes
 			if _, exists := configMap.Data["config.yaml"]; !exists {
-				// Get tunnel ID from Secret
-				secretName := fmt.Sprintf("%s-tunnel-credentials", gateway.Name)
-				tunnelSecret := &corev1.Secret{}
-				if err := r.Get(ctx, types.NamespacedName{Name: secretName, Namespace: gateway.Namespace}, tunnelSecret); err != nil {
-					return fmt.Errorf("failed to get tunnel secret: %w", err)
-				}
-				tunnelID := string(tunnelSecret.Data["tunnel-id"])
-				if tunnelID == "" {
-					return fmt.Errorf("tunnel-id not found in secret")
-				}
-
 				// Generate initial config with just a 404 catch-all
-				generator := cloudflare.NewConfigGenerator()
-				config, err := generator.GenerateConfig(tunnelID, []cloudflare.IngressRule{})
+				config, err := cloudflare.GenerateConfig(tunnelID, []cloudflare.IngressRule{})
 				if err != nil {
 					return err
 				}
@@ -637,8 +624,7 @@ func (r *GatewayReconciler) updateGatewayConfigFromRoutes(ctx context.Context, g
 	}
 
 	// Generate new config
-	generator := cloudflare.NewConfigGenerator()
-	config, err := generator.GenerateConfig(tunnelID, allRules)
+	config, err := cloudflare.GenerateConfig(tunnelID, allRules)
 	if err != nil {
 		return fmt.Errorf("failed to generate config: %w", err)
 	}
