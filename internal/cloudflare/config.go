@@ -60,16 +60,8 @@ type TunnelConfiguration struct {
 	Ingress         []IngressRule `yaml:"ingress"`
 }
 
-// ConfigGenerator generates cloudflared configuration from routing rules
-type ConfigGenerator struct{}
-
-// NewConfigGenerator creates a new config generator
-func NewConfigGenerator() *ConfigGenerator {
-	return &ConfigGenerator{}
-}
-
 // GenerateConfig creates a cloudflared configuration YAML from ingress rules
-func (g *ConfigGenerator) GenerateConfig(tunnelID string, rules []IngressRule) (string, error) {
+func GenerateConfig(tunnelID string, rules []IngressRule) (string, error) {
 	// Ensure there's always a catch-all rule at the end (required by cloudflared)
 	if len(rules) == 0 || rules[len(rules)-1].Service != "http_status:404" {
 		rules = append(rules, IngressRule{
@@ -92,7 +84,7 @@ func (g *ConfigGenerator) GenerateConfig(tunnelID string, rules []IngressRule) (
 }
 
 // GenerateCredentialsJSON creates the credentials file content for cloudflared
-func (g *ConfigGenerator) GenerateCredentialsJSON(accountID, tunnelID, tunnelSecret string) string {
+func GenerateCredentialsJSON(accountID, tunnelID, tunnelSecret string) string {
 	return fmt.Sprintf(`{
 		"AccountTag": "%s",
 		"TunnelID": "%s",
