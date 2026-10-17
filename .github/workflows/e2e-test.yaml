@@ -57,6 +57,7 @@ jobs:
   e2e-test:
     name: End-to-End Tests
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     needs: [check-changes, build-image]
     if: always() && !cancelled() && !failure()
 
@@ -214,8 +215,13 @@ jobs:
 
       - name: Wait for GatewayClass to be accepted
         run: |
-          timeout 60s bash -c 'until kubectl get gatewayclass cloudflare-${{ steps.e2e-id.outputs.E2E_ID }} -o jsonpath="{.status.conditions[?(@.type==\"Accepted\")].status}" | grep -q "True"; do sleep 2; done' || true
+          timeout 60s bash -c 'until kubectl get gatewayclass cloudflare-${{ steps.e2e-id.outputs.E2E_ID }} -o jsonpath="{.status.conditions[?(@.type==\"Accepted\")].status}" | grep -q "True"; do sleep 2; done' || ACCEPTED_FAILED=1
           kubectl get gatewayclass cloudflare-${{ steps.e2e-id.outputs.E2E_ID }} -o yaml
+          if [ -n "${ACCEPTED_FAILED:-}" ]; then
+            echo "::error::GatewayClass was not Accepted - the controller could not validate the Cloudflare credentials"
+            kubectl logs -n cloudflare-gateway-system -l app.kubernetes.io/name=cloudflare-gateway-controller --tail=50
+            exit 1
+          fi
 
       - name: Create Gateway
         run: |
@@ -235,8 +241,13 @@ jobs:
 
       - name: Wait for Gateway to be programmed
         run: |
-          timeout 60s bash -c 'until kubectl get gateway hello-world-gateway-${{ steps.e2e-id.outputs.E2E_ID }} -n cloudflare-gateway-system -o jsonpath="{.status.conditions[?(@.type==\"Programmed\")].status}" | grep -q "True"; do sleep 2; done' || true
+          timeout 60s bash -c 'until kubectl get gateway hello-world-gateway-${{ steps.e2e-id.outputs.E2E_ID }} -n cloudflare-gateway-system -o jsonpath="{.status.conditions[?(@.type==\"Programmed\")].status}" | grep -q "True"; do sleep 2; done' || PROGRAMMED_FAILED=1
           kubectl get gateway hello-world-gateway-${{ steps.e2e-id.outputs.E2E_ID }} -n cloudflare-gateway-system -o yaml
+          if [ -n "${PROGRAMMED_FAILED:-}" ]; then
+            echo "::error::Gateway was not Programmed - the Cloudflare Tunnel was not created"
+            kubectl logs -n cloudflare-gateway-system -l app.kubernetes.io/name=cloudflare-gateway-controller --tail=50
+            exit 1
+          fi
 
       - name: Deploy test application
         run: |
@@ -312,8 +323,13 @@ jobs:
 
       - name: Wait for HTTPRoute to be accepted
         run: |
-          timeout 60s bash -c 'until kubectl get httproute hello-world-${{ steps.e2e-id.outputs.E2E_ID }} -n hello-world -o jsonpath="{.status.parents[0].conditions[?(@.type==\"Accepted\")].status}" | grep -q "True"; do sleep 2; done' || true
+          timeout 60s bash -c 'until kubectl get httproute hello-world-${{ steps.e2e-id.outputs.E2E_ID }} -n hello-world -o jsonpath="{.status.parents[0].conditions[?(@.type==\"Accepted\")].status}" | grep -q "True"; do sleep 2; done' || ROUTE_FAILED=1
           kubectl get httproute hello-world-${{ steps.e2e-id.outputs.E2E_ID }} -n hello-world -o yaml
+          if [ -n "${ROUTE_FAILED:-}" ]; then
+            echo "::error::HTTPRoute was not Accepted"
+            kubectl logs -n cloudflare-gateway-system -l app.kubernetes.io/name=cloudflare-gateway-controller --tail=50
+            exit 1
+          fi
 
       - name: Wait for route to be configured in tunnel
         run: |
@@ -370,8 +386,10 @@ jobs:
       - name: Cleanup Resources
         if: always()
         run: |
-          kubectl delete namespace hello-world --ignore-not-found=true
-          kubectl delete -k config/e2e --ignore-not-found=true || true
+          # --wait=false: the controller finalizes Gateways and HTTPRoutes, so if it
+          # cannot reach Cloudflare these deletes block until the job times out.
+          kubectl delete namespace hello-world --ignore-not-found=true --wait=false || true
+          kubectl delete -k config/e2e --ignore-not-found=true --wait=false || true
 
       - name: Cleanup Cluster
         if: always()
