@@ -126,12 +126,18 @@ func (b *IngressRuleBuilder) Build() []IngressRule {
 }
 
 // ServiceURL constructs an HTTP service URL for cloudflared ingress rules
-func ServiceURL(serviceName, namespace string, port int32, clusterDomain string) string {
-	return ServiceURLWithScheme("http", serviceName, namespace, port, clusterDomain)
+func ServiceURL(serviceName, namespace string, port int32) string {
+	return ServiceURLWithScheme("http", serviceName, namespace, port)
 }
 
-// ServiceURLWithScheme constructs a service URL with the specified scheme (http/https)
-func ServiceURLWithScheme(scheme, serviceName, namespace string, port int32, clusterDomain string) string {
-	// Use Kubernetes cluster DNS format with configurable domain
-	return fmt.Sprintf("%s://%s.%s.svc.%s:%d", scheme, serviceName, namespace, clusterDomain, port)
+// ServiceURLWithScheme constructs a service URL with the specified scheme (http/https).
+//
+// The name is deliberately left partially qualified: cloudflared runs in-cluster with the
+// default ClusterFirst DNS policy, so its resolv.conf search path ("<ns>.svc.<domain>",
+// "svc.<domain>", "<domain>") completes the name whatever the cluster's DNS domain is.
+// Appending an explicit domain would mean asking the operator to tell us something the
+// resolver already knows. This holds only while the cloudflared Deployment keeps cluster
+// DNS - setting hostNetwork or dnsPolicy: Default on it would require an FQDN again.
+func ServiceURLWithScheme(scheme, serviceName, namespace string, port int32) string {
+	return fmt.Sprintf("%s://%s.%s.svc:%d", scheme, serviceName, namespace, port)
 }

@@ -1,0 +1,58 @@
+name: Manifests
+
+on:
+  pull_request:
+    paths:
+      - "config/**"
+      - "cmd/**"
+      - "internal/**"
+      - "Makefile"
+      - ".github/workflows/manifests.yaml"
+  push:
+    branches:
+      - main
+    paths:
+      - "config/**"
+      - "cmd/**"
+      - "internal/**"
+      - "Makefile"
+      - ".github/workflows/manifests.yaml"
+
+env:
+  GO_VERSION: "1.24"
+
+jobs:
+  manifests:
+    name: Validate Kustomize Manifests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v4
+
+      - name: Check generated RBAC is up to date
+        run: |
+          make manifests
+          if ! git diff --exit-code config/rbac/role.yaml; then
+            echo "::error::config/rbac/role.yaml is out of date - run 'make manifests' and commit the result"
+            exit 1
+          fi
+
+      - name: Render manifests
+        run: kubectl kustomize config/default
+
+      - name: Install kubeconform
+        run: go install github.com/yannh/kubeconform/cmd/kubeconform@v0.8.0
+
+      - name: Validate manifests against the Kubernetes schemas
+        run: |
+          kubectl kustomize config/default \
+            | kubeconform -strict -summary -kubernetes-version 1.31.0 -

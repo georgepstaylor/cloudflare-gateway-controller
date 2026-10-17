@@ -16,6 +16,9 @@ CONTROLLER_GEN = $(GOBIN)/controller-gen
 # CONTAINER_TOOL defines the container tool to be used for building images.
 CONTAINER_TOOL ?= docker
 
+# kubectl (>= 1.27) provides the kustomize build/apply used by the deploy targets.
+KUBECTL ?= kubectl
+
 # Setting SHELL to bash allows bash commands to be executed by recipes.
 SHELL = /usr/bin/env bash -o pipefail
 .SHELLFLAGS = -ec
@@ -32,8 +35,8 @@ help: ## Display this help.
 ##@ Development
 
 .PHONY: manifests
-manifests: controller-gen ## Generate RBAC manifests (to copy to Helm chart repo).
-	@$(CONTROLLER_GEN) rbac:roleName=cloudflare-gateway-system-cloudflare-gateway-controller-role paths="./cmd/...;./internal/controller/..." output:rbac:artifacts:config=config/rbac
+manifests: controller-gen ## Generate RBAC manifests into config/rbac.
+	@$(CONTROLLER_GEN) rbac:roleName=cloudflare-gateway-controller paths="./cmd/...;./internal/controller/..." output:rbac:artifacts:config=config/rbac
 
 .PHONY: generate
 generate: controller-gen ## Generate code containing DeepCopy, DeepCopyInto, and DeepCopyObject method implementations.
@@ -73,6 +76,20 @@ docker-push: ## Push docker image.
 docker-buildx: ## Build and push docker image for cross-platform support
 	$(CONTAINER_TOOL) buildx build --platform linux/amd64,linux/arm64 -t ${IMG} --push .
 
+##@ Deployment
+
+.PHONY: deploy
+deploy: manifests ## Deploy the controller to the cluster in ~/.kube/config.
+	$(KUBECTL) apply -k config/default
+
+.PHONY: undeploy
+undeploy: ## Remove the controller from the cluster in ~/.kube/config.
+	$(KUBECTL) delete -k config/default --ignore-not-found=true
+
+.PHONY: render
+render: ## Render the default kustomization to stdout.
+	@$(KUBECTL) kustomize config/default
+
 ##@ Dependencies
 
 .PHONY: controller-gen
@@ -83,4 +100,3 @@ controller-gen: ## Download controller-gen locally if necessary.
 .PHONY: clean
 clean: ## Clean build artifacts.
 	rm -rf bin/
-	rm -rf config/rbac/

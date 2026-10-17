@@ -9,11 +9,17 @@ on:
       - main
   workflow_dispatch:
 
+# Tunnel creation is rate limited per Cloudflare account, not per branch, so only let
+# one e2e run talk to Cloudflare at a time. Queue rather than cancel: a cancelled run
+# leaves the tunnel it created behind.
+concurrency:
+  group: e2e-cloudflare-tunnel
+  cancel-in-progress: false
+
 env:
   GO_VERSION: "1.24"
   KIND_VERSION: "v0.25.0"
   KUBECTL_VERSION: "v1.31.0"
-  HELM_VERSION: "v3.16.3"
   GATEWAY_API_VERSION: "v1.4.0"
 
 jobs:
@@ -58,6 +64,7 @@ jobs:
   e2e-test:
     name: End-to-End Tests
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     needs: [check-changes, build-image]
     if: always() && !cancelled() && !failure()
 
@@ -69,15 +76,6 @@ jobs:
         id: e2e-id
         run: |
           echo "E2E_ID=$(date +%s)" >> $GITHUB_OUTPUT
-
-      - name: Get Secrets
-        uses: bitwarden/sm-action@v2
-        with:
-          cloud_region: eu
-          access_token: ${{ secrets.BW_ACCESS_TOKEN }}
-          secrets: |
-            0bf9c2bd-f0d6-43f0-be07-b39400060b83 > CLOUDFLARE_ACCOUNT_ID
-            8305fd5c-2b7f-482d-8174-b393010e3a32 > CLOUDFLARE_API_TOKEN
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -98,10 +96,6 @@ jobs:
           chmod +x ./kind
           sudo mv ./kind /usr/local/bin/kind
           kind version
-
-      - name: Install Helm
-        uses: azure/setup-helm@v4.3.0
-        id: install
 
       - name: Log in to Container Registry
         uses: docker/login-action@v3
@@ -152,7 +146,7 @@ jobs:
           docker pull "ghcr.io/${{ github.repository }}:${IMAGE_TAG}"
           kind load docker-image "ghcr.io/${{ github.repository }}:${IMAGE_TAG}" --name cloudflare-gateway-e2e
 
-      - name: Add Helm repository and install controller
+      - name: Install controller with kustomize
         run: |
           # Use the newly built image if available, otherwise use the branch tag
           if [ "${{ needs.check-changes.outputs.should-build }}" == "true" ]; then
@@ -166,19 +160,31 @@ jobs:
             fi
           fi
 
-          helm repo add cloudflare-gateway-controller https://georgepstaylor.github.io/cloudflare-gateway-controller-helm-charts
-          helm repo update
+          # Overlay on config/default that points at the image built for this run.
+          mkdir -p config/e2e
+          cat > config/e2e/kustomization.yaml <<EOF
+          apiVersion: kustomize.config.k8s.io/v1beta1
+          kind: Kustomization
 
-          helm install cfgc-${{ steps.e2e-id.outputs.E2E_ID }} \
-            cloudflare-gateway-controller/cloudflare-gateway-controller \
+          resources:
+            - ../default
+
+          images:
+            - name: ghcr.io/georgepstaylor/cloudflare-gateway-controller
+              newName: ghcr.io/${{ github.repository }}
+              newTag: ${IMAGE_TAG}
+          EOF
+
+          kubectl kustomize config/e2e
+          kubectl apply -k config/e2e
+
+          kubectl create secret generic cloudflare-credentials \
             --namespace cloudflare-gateway-system \
-            --create-namespace \
-            --set image.repository=ghcr.io/${{ github.repository }} \
-            --set image.tag="${IMAGE_TAG}" \
-            --set image.pullPolicy=IfNotPresent \
-            --set cloudflare.apiToken=${{ env.CLOUDFLARE_API_TOKEN }} \
-            --set cloudflare.accountId=${{ env.CLOUDFLARE_ACCOUNT_ID }} \
-            --wait --timeout=2m
+            --from-literal=api-token="${{ secrets.CLOUDFLARE_API_TOKEN }}" \
+            --from-literal=account-id="${{ secrets.CLOUDFLARE_ACCOUNT_ID }}"
+
+          kubectl rollout status deployment/cloudflare-gateway-controller \
+            --namespace cloudflare-gateway-system --timeout=2m
 
       - name: Verify controller is running
         run: |
@@ -207,8 +213,13 @@ jobs:
 
       - name: Wait for GatewayClass to be accepted
         run: |
-          timeout 60s bash -c 'until kubectl get gatewayclass cloudflare-${{ steps.e2e-id.outputs.E2E_ID }} -o jsonpath="{.status.conditions[?(@.type==\"Accepted\")].status}" | grep -q "True"; do sleep 2; done' || true
+          timeout 60s bash -c 'until kubectl get gatewayclass cloudflare-${{ steps.e2e-id.outputs.E2E_ID }} -o jsonpath="{.status.conditions[?(@.type==\"Accepted\")].status}" | grep -q "True"; do sleep 2; done' || ACCEPTED_FAILED=1
           kubectl get gatewayclass cloudflare-${{ steps.e2e-id.outputs.E2E_ID }} -o yaml
+          if [ -n "${ACCEPTED_FAILED:-}" ]; then
+            echo "::error::GatewayClass was not Accepted - the controller could not validate the Cloudflare credentials"
+            kubectl logs -n cloudflare-gateway-system -l app.kubernetes.io/name=cloudflare-gateway-controller --tail=50
+            exit 1
+          fi
 
       - name: Create Gateway
         run: |
@@ -228,8 +239,13 @@ jobs:
 
       - name: Wait for Gateway to be programmed
         run: |
-          timeout 60s bash -c 'until kubectl get gateway hello-world-gateway-${{ steps.e2e-id.outputs.E2E_ID }} -n cloudflare-gateway-system -o jsonpath="{.status.conditions[?(@.type==\"Programmed\")].status}" | grep -q "True"; do sleep 2; done' || true
+          timeout 60s bash -c 'until kubectl get gateway hello-world-gateway-${{ steps.e2e-id.outputs.E2E_ID }} -n cloudflare-gateway-system -o jsonpath="{.status.conditions[?(@.type==\"Programmed\")].status}" | grep -q "True"; do sleep 2; done' || PROGRAMMED_FAILED=1
           kubectl get gateway hello-world-gateway-${{ steps.e2e-id.outputs.E2E_ID }} -n cloudflare-gateway-system -o yaml
+          if [ -n "${PROGRAMMED_FAILED:-}" ]; then
+            echo "::error::Gateway was not Programmed - the Cloudflare Tunnel was not created"
+            kubectl logs -n cloudflare-gateway-system -l app.kubernetes.io/name=cloudflare-gateway-controller --tail=50
+            exit 1
+          fi
 
       - name: Deploy test application
         run: |
@@ -305,13 +321,28 @@ jobs:
 
       - name: Wait for HTTPRoute to be accepted
         run: |
-          timeout 60s bash -c 'until kubectl get httproute hello-world-${{ steps.e2e-id.outputs.E2E_ID }} -n hello-world -o jsonpath="{.status.parents[0].conditions[?(@.type==\"Accepted\")].status}" | grep -q "True"; do sleep 2; done' || true
+          timeout 60s bash -c 'until kubectl get httproute hello-world-${{ steps.e2e-id.outputs.E2E_ID }} -n hello-world -o jsonpath="{.status.parents[0].conditions[?(@.type==\"Accepted\")].status}" | grep -q "True"; do sleep 2; done' || ROUTE_FAILED=1
           kubectl get httproute hello-world-${{ steps.e2e-id.outputs.E2E_ID }} -n hello-world -o yaml
+          if [ -n "${ROUTE_FAILED:-}" ]; then
+            echo "::error::HTTPRoute was not Accepted"
+            kubectl logs -n cloudflare-gateway-system -l app.kubernetes.io/name=cloudflare-gateway-controller --tail=50
+            exit 1
+          fi
 
       - name: Wait for route to be configured in tunnel
         run: |
           echo "Waiting for tunnel config to be updated with route..."
           timeout 60s bash -c 'until kubectl get configmap hello-world-gateway-${{ steps.e2e-id.outputs.E2E_ID }}-tunnel-config -n cloudflare-gateway-system -o jsonpath="{.data.config\.yaml}" | grep -q "cfgwc.george.dev"; do sleep 2; done'
+
+          # The backend URL must stay partially qualified so cloudflared's resolv.conf
+          # search path completes it - an explicit cluster domain would be a regression.
+          CONFIG=$(kubectl get configmap hello-world-gateway-${{ steps.e2e-id.outputs.E2E_ID }}-tunnel-config \
+            -n cloudflare-gateway-system -o jsonpath="{.data.config\.yaml}")
+          echo "$CONFIG"
+          if ! grep -q "http://hello-world.hello-world.svc:8080" <<<"$CONFIG"; then
+            echo "::error::tunnel config does not contain the expected service URL"
+            exit 1
+          fi
 
           echo "Restarting cloudflared to pick up new configuration..."
           kubectl delete pods -n cloudflare-gateway-system -l app=cloudflared
@@ -353,8 +384,47 @@ jobs:
       - name: Cleanup Resources
         if: always()
         run: |
-          kubectl delete namespace hello-world --ignore-not-found=true
-          helm uninstall cfgc-${{ steps.e2e-id.outputs.E2E_ID }} -n cloudflare-gateway-system --ignore-not-found || true
+          # Delete the Gateway API resources first, while the controller is still alive,
+          # so its finalizer runs in order. Note this is necessary but not sufficient:
+          # the controller removes the Gateway finalizer even when DeleteTunnel fails,
+          # and deleting a tunnel fails while cloudflared still holds connections. The
+          # "Delete leaked tunnel" step below is the backstop until that is fixed.
+          kubectl delete httproute hello-world-${{ steps.e2e-id.outputs.E2E_ID }} \
+            -n hello-world --ignore-not-found=true --timeout=60s || true
+          kubectl delete gateway hello-world-gateway-${{ steps.e2e-id.outputs.E2E_ID }} \
+            -n cloudflare-gateway-system --ignore-not-found=true --timeout=90s || true
+
+          # The rest is cluster-local, so never block on finalizers here: if the
+          # controller cannot reach Cloudflare these would hang until the job times out.
+          kubectl delete namespace hello-world --ignore-not-found=true --wait=false || true
+          kubectl delete -k config/e2e --ignore-not-found=true --wait=false || true
+
+      - name: Delete leaked tunnel
+        if: always()
+        env:
+          CF_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CF_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          TUNNEL_NAME: cloudflare-gateway-system-hello-world-gateway-${{ steps.e2e-id.outputs.E2E_ID }}
+        run: |
+          api() { curl -s -H "Authorization: Bearer $CF_API_TOKEN" "$@"; }
+          base="https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/cfd_tunnel"
+
+          # cloudflared may still be draining, and a tunnel with live connections
+          # cannot be deleted, so give it a few attempts before giving up.
+          for attempt in 1 2 3 4 5 6; do
+            id=$(api "$base?is_deleted=false&name=$TUNNEL_NAME" | jq -r '.result[0].id // empty')
+            if [ -z "$id" ]; then
+              echo "no tunnel named $TUNNEL_NAME - nothing to clean up"
+              exit 0
+            fi
+            if api -X DELETE "$base/$id" | jq -e '.success' >/dev/null; then
+              echo "deleted leaked tunnel $id"
+              exit 0
+            fi
+            echo "attempt $attempt: tunnel $id not deletable yet, waiting"
+            sleep 10
+          done
+          echo "::warning::leaked tunnel $TUNNEL_NAME could not be deleted"
 
       - name: Cleanup Cluster
         if: always()
