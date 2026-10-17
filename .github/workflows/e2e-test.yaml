@@ -13,7 +13,6 @@ env:
   GO_VERSION: "1.24"
   KIND_VERSION: "v0.25.0"
   KUBECTL_VERSION: "v1.31.0"
-  HELM_VERSION: "v3.16.3"
   GATEWAY_API_VERSION: "v1.4.0"
 
 jobs:
@@ -99,10 +98,6 @@ jobs:
           sudo mv ./kind /usr/local/bin/kind
           kind version
 
-      - name: Install Helm
-        uses: azure/setup-helm@v4.3.0
-        id: install
-
       - name: Log in to Container Registry
         uses: docker/login-action@v3
         with:
@@ -152,7 +147,7 @@ jobs:
           docker pull "ghcr.io/${{ github.repository }}:${IMAGE_TAG}"
           kind load docker-image "ghcr.io/${{ github.repository }}:${IMAGE_TAG}" --name cloudflare-gateway-e2e
 
-      - name: Add Helm repository and install controller
+      - name: Install controller with kustomize
         run: |
           # Use the newly built image if available, otherwise use the branch tag
           if [ "${{ needs.check-changes.outputs.should-build }}" == "true" ]; then
@@ -166,19 +161,31 @@ jobs:
             fi
           fi
 
-          helm repo add cloudflare-gateway-controller https://georgepstaylor.github.io/cloudflare-gateway-controller-helm-charts
-          helm repo update
+          # Overlay on config/default that points at the image built for this run.
+          mkdir -p config/e2e
+          cat > config/e2e/kustomization.yaml <<EOF
+          apiVersion: kustomize.config.k8s.io/v1beta1
+          kind: Kustomization
 
-          helm install cfgc-${{ steps.e2e-id.outputs.E2E_ID }} \
-            cloudflare-gateway-controller/cloudflare-gateway-controller \
+          resources:
+            - ../default
+
+          images:
+            - name: ghcr.io/georgepstaylor/cloudflare-gateway-controller
+              newName: ghcr.io/${{ github.repository }}
+              newTag: ${IMAGE_TAG}
+          EOF
+
+          kubectl kustomize config/e2e
+          kubectl apply -k config/e2e
+
+          kubectl create secret generic cloudflare-credentials \
             --namespace cloudflare-gateway-system \
-            --create-namespace \
-            --set image.repository=ghcr.io/${{ github.repository }} \
-            --set image.tag="${IMAGE_TAG}" \
-            --set image.pullPolicy=IfNotPresent \
-            --set cloudflare.apiToken=${{ env.CLOUDFLARE_API_TOKEN }} \
-            --set cloudflare.accountId=${{ env.CLOUDFLARE_ACCOUNT_ID }} \
-            --wait --timeout=2m
+            --from-literal=api-token="${{ env.CLOUDFLARE_API_TOKEN }}" \
+            --from-literal=account-id="${{ env.CLOUDFLARE_ACCOUNT_ID }}"
+
+          kubectl rollout status deployment/cloudflare-gateway-controller \
+            --namespace cloudflare-gateway-system --timeout=2m
 
       - name: Verify controller is running
         run: |
@@ -313,6 +320,16 @@ jobs:
           echo "Waiting for tunnel config to be updated with route..."
           timeout 60s bash -c 'until kubectl get configmap hello-world-gateway-${{ steps.e2e-id.outputs.E2E_ID }}-tunnel-config -n cloudflare-gateway-system -o jsonpath="{.data.config\.yaml}" | grep -q "cfgwc.george.dev"; do sleep 2; done'
 
+          # The backend URL must stay partially qualified so cloudflared's resolv.conf
+          # search path completes it - an explicit cluster domain would be a regression.
+          CONFIG=$(kubectl get configmap hello-world-gateway-${{ steps.e2e-id.outputs.E2E_ID }}-tunnel-config \
+            -n cloudflare-gateway-system -o jsonpath="{.data.config\.yaml}")
+          echo "$CONFIG"
+          if ! grep -q "http://hello-world.hello-world.svc:8080" <<<"$CONFIG"; then
+            echo "::error::tunnel config does not contain the expected service URL"
+            exit 1
+          fi
+
           echo "Restarting cloudflared to pick up new configuration..."
           kubectl delete pods -n cloudflare-gateway-system -l app=cloudflared
 
@@ -354,7 +371,7 @@ jobs:
         if: always()
         run: |
           kubectl delete namespace hello-world --ignore-not-found=true
-          helm uninstall cfgc-${{ steps.e2e-id.outputs.E2E_ID }} -n cloudflare-gateway-system --ignore-not-found || true
+          kubectl delete -k config/e2e --ignore-not-found=true || true
 
       - name: Cleanup Cluster
         if: always()

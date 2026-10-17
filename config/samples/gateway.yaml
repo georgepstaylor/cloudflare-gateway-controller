@@ -1,0 +1,11 @@
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: my-gateway
+  namespace: cloudflare-gateway-system
+spec:
+  gatewayClassName: cloudflare
+  listeners:
+    - name: http
+      protocol: HTTP
+      port: 80

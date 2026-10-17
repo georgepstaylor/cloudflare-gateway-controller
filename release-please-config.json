@@ -31,7 +31,9 @@
                 }
             ],
             "extra-files": [
-                "Makefile"
+                "Makefile",
+                "config/manager/kustomization.yaml",
+                "README.md"
             ]
         }
     }

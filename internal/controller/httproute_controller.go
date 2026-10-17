@@ -32,8 +32,7 @@ const (
 // HTTPRouteReconciler reconciles a HTTPRoute object
 type HTTPRouteReconciler struct {
 	client.Client
-	Scheme        *runtime.Scheme
-	ClusterDomain string
+	Scheme *runtime.Scheme
 }
 
 //+kubebuilder:rbac:groups=gateway.networking.k8s.io,resources=httproutes,verbs=get;list;watch;create;update;patch;delete
@@ -221,7 +220,7 @@ func (r *HTTPRouteReconciler) buildIngressRules(ctx context.Context, route *gate
 			return nil, fmt.Errorf("no port found for service %s/%s", serviceNamespace, serviceName)
 		}
 
-		serviceURL := cloudflare.ServiceURL(serviceName, serviceNamespace, port, r.ClusterDomain)
+		serviceURL := cloudflare.ServiceURL(serviceName, serviceNamespace, port)
 
 		// Check if service uses HTTPS (via annotation or port)
 		scheme := "http"
@@ -233,7 +232,7 @@ func (r *HTTPRouteReconciler) buildIngressRules(ctx context.Context, route *gate
 		}
 
 		if scheme == "https" {
-			serviceURL = cloudflare.ServiceURLWithScheme("https", serviceName, serviceNamespace, port, r.ClusterDomain)
+			serviceURL = cloudflare.ServiceURLWithScheme("https", serviceName, serviceNamespace, port)
 		}
 
 		// Build origin request config from annotations
