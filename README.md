@@ -55,7 +55,7 @@ kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/downloa
 Apply a tagged release straight from GitHub:
 
 ```bash
-kubectl apply -k 'github.com/georgepstaylor/cloudflare-gateway-controller/config/default?ref=v0.2.0' # x-release-please-version
+kubectl apply -k 'github.com/georgepstaylor/cloudflare-gateway-controller/config/default?ref=v0.3.0' # x-release-please-version
 ```
 
 This creates the namespace, ServiceAccount, ClusterRole, ClusterRoleBinding and the
@@ -76,7 +76,7 @@ kubectl create secret generic cloudflare-credentials \
 ### 4. Create a GatewayClass
 
 ```bash
-kubectl apply -f https://raw.githubusercontent.com/georgepstaylor/cloudflare-gateway-controller/v0.2.0/config/samples/gatewayclass.yaml # x-release-please-version
+kubectl apply -f https://raw.githubusercontent.com/georgepstaylor/cloudflare-gateway-controller/v0.3.0/config/samples/gatewayclass.yaml # x-release-please-version
 ```
 
 Sample Gateway and HTTPRoute manifests are in [`config/samples/`](config/samples/).
@@ -139,11 +139,11 @@ kind: Kustomization
 namespace: cloudflare-gateway-system
 
 resources:
-  - github.com/georgepstaylor/cloudflare-gateway-controller/config/default?ref=v0.2.0 # x-release-please-version
+  - github.com/georgepstaylor/cloudflare-gateway-controller/config/default?ref=v0.3.0 # x-release-please-version
 
 images:
   - name: ghcr.io/georgepstaylor/cloudflare-gateway-controller
-    newTag: 0.2.0 # x-release-please-version
+    newTag: 0.3.0 # x-release-please-version
 
 replicas:
   - name: cloudflare-gateway-controller
@@ -190,7 +190,7 @@ make undeploy               # remove it again
 ### Uninstallation
 
 ```bash
-kubectl delete -k 'github.com/georgepstaylor/cloudflare-gateway-controller/config/default?ref=v0.2.0' # x-release-please-version
+kubectl delete -k 'github.com/georgepstaylor/cloudflare-gateway-controller/config/default?ref=v0.3.0' # x-release-please-version
 ```
 
 Gateways created by the controller are cleaned up (and their Cloudflare Tunnels deleted)
