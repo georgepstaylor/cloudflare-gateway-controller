@@ -7,4 +7,4 @@ resources:
 images:
   - name: controller
     newName: ghcr.io/georgepstaylor/cloudflare-gateway-controller
-    newTag: 0.3.0 # x-release-please-version
+    newTag: 0.1.7 # x-release-please-version
