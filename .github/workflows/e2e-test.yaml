@@ -384,8 +384,17 @@ jobs:
       - name: Cleanup Resources
         if: always()
         run: |
-          # --wait=false: the controller finalizes Gateways and HTTPRoutes, so if it
-          # cannot reach Cloudflare these deletes block until the job times out.
+          # Delete the Gateway API resources first and give the controller a bounded
+          # window to finalize them: that is what deletes the Cloudflare Tunnel. Without
+          # it the controller is torn down with the cluster and every run leaks a tunnel,
+          # which is how the account accumulated 18 of them and started rate limiting.
+          kubectl delete httproute hello-world-${{ steps.e2e-id.outputs.E2E_ID }} \
+            -n hello-world --ignore-not-found=true --timeout=60s || true
+          kubectl delete gateway hello-world-gateway-${{ steps.e2e-id.outputs.E2E_ID }} \
+            -n cloudflare-gateway-system --ignore-not-found=true --timeout=90s || true
+
+          # The rest is cluster-local, so never block on finalizers here: if the
+          # controller cannot reach Cloudflare these would hang until the job times out.
           kubectl delete namespace hello-world --ignore-not-found=true --wait=false || true
           kubectl delete -k config/e2e --ignore-not-found=true --wait=false || true
 
