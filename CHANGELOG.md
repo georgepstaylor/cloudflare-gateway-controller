@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.2](https://github.com/georgepstaylor/cloudflare-gateway-controller/compare/v0.3.1...v0.3.2) (2026-10-17)
+
+
+### Bug Fixes
+
+* **controller:** make the cloudflared deployment have one writer ([#22](https://github.com/georgepstaylor/cloudflare-gateway-controller/issues/22)) ([073374e](https://github.com/georgepstaylor/cloudflare-gateway-controller/commit/073374e7731d78f74634cf8603c07ff1619d41de))
+
 ## [0.3.1](https://github.com/georgepstaylor/cloudflare-gateway-controller/compare/v0.3.0...v0.3.1) (2026-10-17)
 
 
