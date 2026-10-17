@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.1](https://github.com/georgepstaylor/cloudflare-gateway-controller/compare/v0.3.0...v0.3.1) (2026-10-17)
+
+
+### Bug Fixes
+
+* **container:** cross-compile instead of emulating the target arch ([#20](https://github.com/georgepstaylor/cloudflare-gateway-controller/issues/20)) ([5cfad54](https://github.com/georgepstaylor/cloudflare-gateway-controller/commit/5cfad542c5bbb5aa0be27dfe6fc61b0e5c0253fb))
+
 ## [0.3.0](https://github.com/georgepstaylor/cloudflare-gateway-controller/compare/cloudflare-gateway-controller-v0.2.0...cloudflare-gateway-controller-v0.3.0) (2026-10-17)
 
 
