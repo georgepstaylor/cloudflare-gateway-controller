@@ -1,5 +1,8 @@
-# Build stage
-FROM golang:1.24-alpine AS builder
+# Build stage. --platform=$BUILDPLATFORM keeps this stage on the builder's native
+# architecture so Go cross-compiles via TARGETOS/TARGETARCH below; without it buildx
+# emulates the whole toolchain under QEMU for foreign targets, which took ~26 minutes
+# per release.
+FROM --platform=$BUILDPLATFORM golang:1.24-alpine AS builder
 
 WORKDIR /workspace
 
@@ -14,7 +17,7 @@ COPY internal/ internal/
 # Build using build args from buildx
 ARG TARGETOS
 ARG TARGETARCH
-RUN GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -o manager cmd/main.go
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -o manager cmd/main.go
 
 # Runtime stage
 FROM gcr.io/distroless/static:nonroot
