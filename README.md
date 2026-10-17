@@ -201,7 +201,9 @@ when you delete the Gateway resources, so delete those before removing the contr
 ### GatewayClass
 - Validates controller ownership (`controllerName`)
 - References a Secret containing Cloudflare API credentials
-- Validates credentials can authenticate with Cloudflare API
+- Checks the credentials Secret exists and has `api-token` and `account-id` set (it does
+  not call the Cloudflare API, so an invalid token is only discovered when a Gateway is
+  reconciled)
 - Sets `Accepted` status condition
 
 ### Gateway (Represents a Cloudflare Tunnel)
