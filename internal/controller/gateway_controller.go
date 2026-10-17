@@ -27,6 +27,10 @@ import (
 const (
 	controllerName   = "george.dev/cloudflare-gateway-controller"
 	gatewayFinalizer = controllerName
+
+	// configHashAnnotation carries a hash of the cloudflared config on the pod
+	// template, so the pods roll when the config they mount changes.
+	configHashAnnotation = "cloudflare-gateway-controller/config-hash"
 )
 
 // GatewayReconciler reconciles a Gateway object
@@ -388,6 +392,11 @@ func (r *GatewayReconciler) reconcileConfigMap(ctx context.Context, gateway *gat
 func (r *GatewayReconciler) reconcileDeployment(ctx context.Context, gateway *gatewayv1.Gateway) error {
 	deploymentName := fmt.Sprintf("%s-cloudflared", gateway.Name)
 
+	configHash, err := r.tunnelConfigHash(ctx, gateway)
+	if err != nil {
+		return fmt.Errorf("failed to hash tunnel config: %w", err)
+	}
+
 	// Use retry logic to handle concurrent modifications
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		deployment := &appsv1.Deployment{
@@ -398,6 +407,14 @@ func (r *GatewayReconciler) reconcileDeployment(ctx context.Context, gateway *ga
 		}
 
 		_, err := controllerutil.CreateOrUpdate(ctx, r.Client, deployment, func() error {
+			// Derive the config hash here, in the only writer of the pod template, from
+			// the ConfigMap cloudflared actually mounts. That keeps the desired template
+			// a pure function of observed state, so repeated reconciles converge.
+			var podAnnotations map[string]string
+			if configHash != "" {
+				podAnnotations = map[string]string{configHashAnnotation: configHash}
+			}
+
 			replicas := int32(2)
 			deployment.Spec = appsv1.DeploymentSpec{
 				Replicas: &replicas,
@@ -413,6 +430,7 @@ func (r *GatewayReconciler) reconcileDeployment(ctx context.Context, gateway *ga
 							"app":     "cloudflared",
 							"gateway": gateway.Name,
 						},
+						Annotations: podAnnotations,
 					},
 					Spec: corev1.PodSpec{
 						Containers: []corev1.Container{
@@ -655,40 +673,28 @@ func (r *GatewayReconciler) updateGatewayConfigFromRoutes(ctx context.Context, g
 
 	logger.Info("updated gateway config", "routes", len(routes), "rules", len(allRules))
 
-	// Update deployment annotation to trigger rollout when config changes
-	if err := r.updateDeploymentConfigHash(ctx, gateway, config); err != nil {
-		logger.Error(err, "failed to update deployment config hash")
-		// Don't fail the reconciliation - config is updated, deployment will pick it up eventually
-	}
+	// The Deployment picks the new config up on the reconcile this ConfigMap write
+	// triggers: reconcileDeployment hashes the ConfigMap itself.
 
 	return nil
 }
 
-// updateDeploymentConfigHash updates the cloudflared deployment with a hash of the config
-// This triggers an automatic rollout when the config changes
-func (r *GatewayReconciler) updateDeploymentConfigHash(ctx context.Context, gateway *gatewayv1.Gateway, config string) error {
-	deploymentName := fmt.Sprintf("%s-cloudflared", gateway.Name)
-
-	// Calculate hash of the config
-	configHash := fmt.Sprintf("%x", md5.Sum([]byte(config)))[:10]
-
-	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		deployment := &appsv1.Deployment{}
-		if err := r.Get(ctx, types.NamespacedName{
-			Name:      deploymentName,
-			Namespace: gateway.Namespace,
-		}, deployment); err != nil {
-			return err
+// tunnelConfigHash hashes the cloudflared config carried by the Gateway's ConfigMap.
+// An absent ConfigMap yields an empty hash: it is written before the Deployment, and
+// that write triggers another reconcile.
+func (r *GatewayReconciler) tunnelConfigHash(ctx context.Context, gateway *gatewayv1.Gateway) (string, error) {
+	configMap := &corev1.ConfigMap{}
+	if err := r.Get(ctx, types.NamespacedName{
+		Name:      fmt.Sprintf("%s-tunnel-config", gateway.Name),
+		Namespace: gateway.Namespace,
+	}, configMap); err != nil {
+		if apierrors.IsNotFound(err) {
+			return "", nil
 		}
+		return "", err
+	}
 
-		// Update the pod template annotation to trigger a rollout
-		if deployment.Spec.Template.Annotations == nil {
-			deployment.Spec.Template.Annotations = make(map[string]string)
-		}
-		deployment.Spec.Template.Annotations["cloudflare-gateway-controller/config-hash"] = configHash
-
-		return r.Update(ctx, deployment)
-	})
+	return fmt.Sprintf("%x", md5.Sum([]byte(configMap.Data["config.yaml"])))[:10], nil
 }
 
 // routeConflict represents a conflict between HTTPRoutes
