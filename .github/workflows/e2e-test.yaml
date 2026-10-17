@@ -9,6 +9,13 @@ on:
       - main
   workflow_dispatch:
 
+# Tunnel creation is rate limited per Cloudflare account, not per branch, so only let
+# one e2e run talk to Cloudflare at a time. Queue rather than cancel: a cancelled run
+# leaves the tunnel it created behind.
+concurrency:
+  group: e2e-cloudflare-tunnel
+  cancel-in-progress: false
+
 env:
   GO_VERSION: "1.24"
   KIND_VERSION: "v0.25.0"
