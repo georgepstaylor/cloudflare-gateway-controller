@@ -49,5 +49,10 @@ jobs:
       - name: Render manifests
         run: kubectl kustomize config/default
 
-      - name: Validate manifests
-        run: kubectl kustomize config/default | kubectl apply --dry-run=client --validate=false -f -
+      - name: Install kubeconform
+        run: go install github.com/yannh/kubeconform/cmd/kubeconform@v0.8.0
+
+      - name: Validate manifests against the Kubernetes schemas
+        run: |
+          kubectl kustomize config/default \
+            | kubeconform -strict -summary -kubernetes-version 1.31.0 -
